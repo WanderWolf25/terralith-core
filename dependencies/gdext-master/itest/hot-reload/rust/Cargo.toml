@@ -1,0 +1,16 @@
+[package]
+name = "hot-reload"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "MPL-2.0"
+publish = false
+
+[features]
+signal-test = []
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = { path = "../../../godot", default-features = false }

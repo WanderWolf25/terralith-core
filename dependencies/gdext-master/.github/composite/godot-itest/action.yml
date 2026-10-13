@@ -1,0 +1,221 @@
+# Copyright (c) godot-rust; Bromeon and contributors.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: godot
+description: "Run Godot integration tests"
+
+inputs:
+  run-editor-itest:
+    required: false
+    default: 'true'
+    description: "Run editor-mode integration tests (godot -e --headless). Set to 'false' for non-editor Godot builds (template_release)."
+
+  godot-indirect-json:
+    required: false
+    default: ''
+    description: "If set to true, compiles godot-rust with the `api-custom-json` feature against the generated JSON file"
+
+  artifact-name:
+    required: true
+    description: "Name of the compiled Godot artifact to download"
+
+  godot-binary:
+    required: true
+    description: "Filename of the Godot executable"
+
+  godot-args:
+    required: false
+    default: ''
+    description: "Command-line arguments passed to Godot"
+
+  # Currently unused; could be removed entirely.
+  godot-check-header:
+    required: false
+    default: 'false'
+    description: "Should the job check against latest gdextension_interface.h, and warn on difference"
+
+  godot-prebuilt-patch:
+    required: false
+    default: ''
+    description: "If specified, sets the branch name of the godot4-prebuilt crate to this value. Example '4.2' or '4.2.2' (latter being currently disabled, https://github.com/godot-rust/gdext/pull/1505)"
+
+  rust-toolchain:
+    required: false
+    default: 'stable'
+    description: "Rust toolchain specifier (e.g. 'nightly')"
+
+  rust-extra-args:
+    required: false
+    default: ''
+    description: "Extra command line arguments for 'cargo build', e.g. features"
+
+  rust-env-rustflags:
+    required: false
+    default: ''
+    description: "Extra values for the RUSTFLAGS env var"
+
+  rust-extra-env:
+    required: false
+    default: ''
+    description: "Extra env values to be passed during cargo build"
+
+  rust-target:
+    required: false
+    default: ''
+    description: "If provided, acts as an argument for '--target', and results in output files written to ./target/{target}"
+
+  rust-target-dir:
+    required: false
+    default: ''
+    description: "If provided, determines where to find the generated dylib. Example: 'release' if Godot editor build would look for debug otherwise."
+
+  rust-cache-key:
+    required: false
+    default: ''
+    description: "Extra key to resolve Rust cache"
+
+runs:
+  using: "composite"
+  steps:
+    # Do not check out here, as this would overwrite (clean) the current directory and is already done by the parent workflow.
+
+    - name: "Install Godot"
+      uses: ./.github/composite/godot-install
+      with:
+        artifact-name: ${{ inputs.artifact-name }}
+        godot-binary: ${{ inputs.godot-binary }}
+
+    # The chmod seems still necessary, although applied before uploading artifact. Possibly modes are not preserved.
+    # The `| xargs` pattern trims the output, since printed version may contain extra newline, which causes problems in env vars.
+    - name: "Inspect Godot version"
+      run: |
+        godotVer=$($GDRUST_GODOT_BIN --version | xargs)
+        gitSha=$(echo $godotVer | sed -E "s/.+custom_build\.//")
+        echo "GODOT_BUILT_FROM=_Built from [\`$godotVer\`](https://github.com/godotengine/godot/commit/$gitSha)._" >> $GITHUB_ENV
+      shell: bash
+
+    - name: "Install Rust"
+      uses: ./.github/composite/rust
+      with:
+        rust: ${{ inputs.rust-toolchain }}
+        cache-key: ${{ inputs.rust-cache-key }}
+
+    # if
+    - name: "Patch prebuilt version ({{ inputs.godot-prebuilt-patch }})"
+      if: inputs.godot-prebuilt-patch != ''
+      env:
+        PATCHED_VERSION: ${{ inputs.godot-prebuilt-patch }}
+      # sed -i'' needed for macOS compatibility, see https://stackoverflow.com/q/4247068
+      run: |
+        # Specify `api-*` feature for godot crate if needed.
+        .github/other/patch-prebuilt.sh "$PATCHED_VERSION"
+        
+        # Reduce versions to "major.minor" format.
+        apiVersion=$(echo "$PATCHED_VERSION" | sed -E 's/([0-9]+\.[0-9]+)\.[0-9]+/\1/')
+        apiDefaultVersion=$(echo "$defaultVersion" | sed -E 's/([0-9]+\.[0-9]+)\.[0-9]+/\1/')
+        
+        # For newer versions, update 'compatibility_minimum' in .gdextension files to the respective version.
+        # Nothing needs to be done for 4.0.x, as compatibility_minimum didn't exist back then (we do it due to easier code, anyway).
+        if [[ "$apiVersion" == "$apiDefaultVersion" ]]; then
+          echo "Already has version $version; no need to change compatibility_minimum."
+      
+        else
+          echo "Update compatibility_minimum in .gdextension files to '$apiVersion'..."
+          dirs=("itest")
+        
+          # Note that this is still hardcoded to 4.2, the lowest supported API level by godot-rust. This makes it easier for users
+          # to use godot-rust with older Godot versions. There is anyway a runtime check in gdext that checks compatibility again.
+          for dir in "${dirs[@]}"; do
+              find "$dir" -type f -name "*.gdextension" -exec sed -i'.bak' "s/compatibility_minimum = 4\.2/compatibility_minimum = $apiVersion/" {} +
+          done
+        
+          echo "Example output: itest/godot/itest.gdextension"
+          echo "----------------------------------------------------"
+          cat itest/godot/itest.gdextension
+          echo "----------------------------------------------------"
+        fi
+
+      shell: bash
+
+    # else if
+    - name: "Dump extension api"
+      if: inputs.godot-prebuilt-patch == '' && inputs.godot-indirect-json == 'true'
+      run: |
+        $GDRUST_GODOT_BIN --headless --dump-extension-api
+        mv extension_api.json $RUNNER_DIR/godot_bin/extension_api.json
+        $GDRUST_GODOT_BIN --headless --dump-gdextension-interface-json
+        mv gdextension_interface.json $RUNNER_DIR/godot_bin/gdextension_interface.json
+        echo "GDRUST_GODOT_API_JSON=$RUNNER_DIR/godot_bin/extension_api.json" >> $GITHUB_ENV
+        echo "GDRUST_GODOT_INTERFACE_JSON=$RUNNER_DIR/godot_bin/gdextension_interface.json" >> $GITHUB_ENV
+      shell: bash
+
+    # else
+    - name: "No patch selected"
+      if: inputs.godot-prebuilt-patch == '' && inputs.godot-indirect-json != 'true'
+      run: |
+          echo "No patch selected; use default godot4-prebuilt version."
+      shell: bash
+
+    - name: "Build gdext (itest)"
+      env:
+        RUSTFLAGS: ${{ inputs.rust-env-rustflags }}
+        TARGET: ${{ inputs.rust-target }}
+        OUTPUT_DIR: ${{ inputs.rust-target-dir || 'debug' }}
+      run: |
+        targetArgs=""
+        if [[ -n "$TARGET" ]]; then
+          targetArgs="--target $TARGET"
+        fi
+        
+        # Keep `--no-default-features` even if it's currently redundant. Features may change.
+        ${{ inputs.rust-extra-env }} cargo build -p itest --no-default-features ${{ inputs.rust-extra-args }} $targetArgs
+        
+        # Instead of modifying .gdextension, rename the output directory.
+        if [[ -n "$TARGET" ]]; then
+          rm -rf target/debug target/release
+          echo "Build output (tree -L 2 target/$TARGET/$OUTPUT_DIR):"
+          tree -L 2 target/$TARGET/$OUTPUT_DIR || echo "(tree not installed)"
+          mv target/$TARGET/$OUTPUT_DIR target/ || {
+            echo "::error::Output dir $TARGET/$OUTPUT_DIR not found"
+            exit 1
+          }
+        #  echo "Intermediate dir (tree -L 2 target):"
+        #  tree -L 2 target || echo "(tree not installed)"
+          if [[ "$OUTPUT_DIR" != "debug" ]]; then
+            mv target/$OUTPUT_DIR target/debug
+          fi
+          echo "Resulting dir (tree -L 2 target):"
+          tree -L 2 target || echo "(tree not installed)"
+        #  echo "itest.gdextension contents:"
+        #  cat itest/godot/itest.gdextension
+        #  echo "----------------------------------------------------"
+        fi
+      shell: bash
+
+    - name: "Run Godot integration tests"
+      run: .github/other/run-godot-itest.sh "" "${{ runner.temp }}/log-runtime.txt" OUTCOME_RUNTIME itest godot-runtime ${{ inputs.godot-args }}
+      shell: bash
+
+    - name: "Check for memory leaks"
+      run: .github/other/check-godot-leaks.sh "${{ runner.temp }}/log-runtime.txt" OUTCOME_RUNTIME godot-leak
+      shell: bash
+
+    - name: "Run Godot editor integration tests"
+      if: always() && inputs.run-editor-itest == 'true'
+      run: .github/other/run-godot-itest.sh "-e" "${{ runner.temp }}/log-editor.txt" OUTCOME_EDITOR editor-itest godot-editor-runtime ${{ inputs.godot-args }}
+      shell: bash
+
+    - name: "Check for memory leaks (editor)"
+      if: always() && inputs.run-editor-itest == 'true'
+      run: .github/other/check-godot-leaks.sh "${{ runner.temp }}/log-editor.txt" OUTCOME_EDITOR godot-editor-leak
+      shell: bash
+
+    - name: "Conclusion"
+      if: always()
+      run: |
+        echo "Evaluate conclusion: $OUTCOME_RUNTIME, editor: ${OUTCOME_EDITOR:-(skipped)}"
+        .github/other/conclude-godot-itest.sh "$OUTCOME_RUNTIME"
+        .github/other/conclude-godot-itest.sh "${OUTCOME_EDITOR:-}" "editor"
+      shell: bash

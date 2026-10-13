@@ -1,0 +1,70 @@
+[profile.dev]
+# Skips type/variable debug metadata while keeping file:line info for backtraces. Saves 1-4% build time on clean dev builds.
+debug = "line-tables-only"
+
+# Build for `check.sh bench`. A single codegen unit + fat LTO prevents unrelated code from being compiled differently in two builds,
+# which otherwise moves benchmarks by several percent. See the module docs of itest/rust/src/framework/bencher.rs.
+[profile.itest-bench]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[workspace]
+resolver = "2"
+members = [
+    "godot-bindings",
+    "godot-codegen",
+    "godot-ffi",
+    "godot-core",
+    "godot-macros",
+    "godot-cell",
+    "godot",
+
+    # Godot integration
+    "itest/rust",
+    "itest/repo-tweak",
+    "itest/hot-reload/rust",
+    "itest/itest-dependency"
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+
+# All dependencies except own crates of this project should be specified here, independently of whether they're dev, build or
+# regular dependencies. Sort alphabetically within each section; comments about a dependency come on the section header.
+[workspace.dependencies]
+# Related to godot-rust.
+gdextension-api = { version = "0.5.0", git = "https://github.com/godot-rust/godot4-prebuilt", branch = "release-v0.5" }
+
+# Main library features.
+glam = { version = "0.32", features = ["debug-glam-assert"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Related to tooling/build setup.
+# * regex: not used for unicode parsing -> features unicode-bool + unicode-gencat are enabled instead of unicode-perl.
+#          'unicode-gencat' needed for \d, see https://docs.rs/regex/latest/regex/#unicode-features.
+libc = "0.2.183"
+regex = { version = "1.12", default-features = false, features = ["std", "unicode-bool", "unicode-gencat"] }
+which = "8"
+
+# Macros and codegen. Minimal versions compatible with -Zminimal-versions.
+# * proc_macro2: Literal::c_string() added in 1.0.80.
+# * quote: 1.0.37 allows tokenizing CStr.
+# * venial: 0.6.1 contains some bugfixes.
+heck = "0.5"
+litrs = { version = "1.0", features = ["proc-macro2"] }
+markdown = "1.0.0"
+nanoserde = "0.2"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+venial = "0.6.1"
+
+# Testing (itest).
+pin-project-lite = { version = "0.2" }
+
+# Note about Jetbrains IDEs: "IDE Sync" (Refresh Cargo projects) may cause static analysis errors such as
+# "at most one `api-*` feature can be enabled". This is because by default, all Cargo features are enabled,
+# which isn't a setup we support. To address this, individual features can be enabled in the various
+# Cargo.toml files: https://www.jetbrains.com/help/rust/rust-cfg-support.html#enable-disable-feature-manually.

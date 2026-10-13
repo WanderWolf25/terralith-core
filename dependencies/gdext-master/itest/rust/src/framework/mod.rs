@@ -1,0 +1,439 @@
+/*
+ * Copyright (c) godot-rust; Bromeon and contributors.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use std::collections::HashSet;
+use std::panic;
+
+use godot::classes::{Engine, GDScript, Node, Os, SceneTree};
+use godot::obj::{Gd, NewGd, Singleton};
+use godot::sys;
+
+mod bencher;
+mod runner;
+
+pub use bencher::*;
+/// Allow re-import as `crate::framework::itest`.
+pub use godot::test::{bench, itest};
+pub use runner::*;
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Shard registration
+
+// Registers all the `#[itest]` tests and `#[bench]` benchmarks.
+sys::shard_registry!(pub(crate) __GODOT_ITEST: RustTestCase);
+sys::shard_registry!(pub(crate) __GODOT_ASYNC_ITEST: AsyncRustTestCase);
+sys::shard_registry!(pub(crate) __GODOT_BENCH: RustBenchmark);
+
+/// Finds all `#[itest]` tests.
+fn collect_rust_tests(filters: &[String]) -> (Vec<RustTestCase>, HashSet<&str>, bool) {
+    let mut all_files = HashSet::new();
+    let mut tests: Vec<RustTestCase> = vec![];
+    let mut is_focused_run = false;
+    let in_editor = Engine::singleton().is_editor_hint();
+
+    sys::shard_foreach!(__GODOT_ITEST; |test: &RustTestCase| {
+        // Editor itests run only in editor; non-editor itests run only outside editor.
+        if test.editor_only != in_editor {
+            return;
+        }
+
+        // First time a focused test is encountered, switch to "focused" mode and throw everything away.
+        if !is_focused_run && test.focused {
+            tests.clear();
+            all_files.clear();
+            is_focused_run = true;
+        }
+
+        // Only collect tests if normal mode, or focus mode and test is focused.
+        if (!is_focused_run || test.focused) && passes_filter(filters, test.name) {
+            all_files.insert(test.file);
+            tests.push(*test);
+        }
+    });
+
+    // Sort alphabetically for deterministic run order
+    tests.sort_by_key(|test| test.file);
+
+    (tests, all_files, is_focused_run)
+}
+
+/// Finds all `#[itest(async)]` tests.
+fn collect_async_rust_tests(
+    filters: &[String],
+    sync_focused_run: bool,
+) -> (Vec<AsyncRustTestCase>, HashSet<&str>, bool) {
+    let mut all_files = HashSet::new();
+    let mut tests = vec![];
+    let mut is_focused_run = sync_focused_run;
+    let in_editor = Engine::singleton().is_editor_hint();
+
+    sys::shard_foreach!(__GODOT_ASYNC_ITEST; |test: &AsyncRustTestCase| {
+        // Editor itests run only in editor; non-editor itests run only outside editor.
+        if test.editor_only != in_editor {
+            return;
+        }
+
+        // First time a focused test is encountered, switch to "focused" mode and throw everything away.
+        if !is_focused_run && test.focused {
+            tests.clear();
+            all_files.clear();
+            is_focused_run = true;
+        }
+
+        // Only collect tests if normal mode, or focus mode and test is focused.
+        if (!is_focused_run || test.focused) && passes_filter(filters, test.name) {
+            all_files.insert(test.file);
+            tests.push(*test);
+        }
+    });
+
+    // Sort alphabetically for deterministic run order
+    tests.sort_by_key(|test| test.file);
+
+    (tests, all_files, is_focused_run)
+}
+
+/// Whether a benchmark is an anchor, i.e. measures plain Rust code; see `benchmarks/anchor_bench.rs`.
+pub fn is_anchor(bench_name: &str) -> bool {
+    bench_name.starts_with("anchor_")
+}
+
+/// Finds all `#[bench]` benchmarks.
+fn collect_rust_benchmarks(filters: &[String]) -> (Vec<RustBenchmark>, usize) {
+    let mut all_files = HashSet::new();
+    let mut benchmarks: Vec<RustBenchmark> = vec![];
+
+    sys::shard_foreach!(__GODOT_BENCH; |bench: &RustBenchmark| {
+        // Anchors always run, so that a filtered run still has a noise floor to interpret its numbers against.
+        if !is_anchor(bench.name) && !passes_filter(filters, bench.name) {
+            return;
+        }
+
+        benchmarks.push(*bench);
+        all_files.insert(bench.file);
+    });
+
+    // Sort alphabetically for deterministic run order
+    benchmarks.sort_by_key(|bench| bench.file);
+
+    (benchmarks, all_files.len())
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Shared types
+#[derive(Clone)]
+pub struct TestContext {
+    pub scene_tree: Gd<Node>,
+    pub property_tests: Gd<Node>,
+}
+
+/// Utility to assert that something can be sent between threads.
+pub struct ThreadCrosser<T> {
+    value: T,
+}
+
+impl<T> ThreadCrosser<T> {
+    pub fn new(value: T) -> Self {
+        Self { value }
+    }
+
+    /// # Safety
+    /// Bypasses `Send` checks, user's responsibility.
+    pub unsafe fn extract(self) -> T {
+        self.value
+    }
+}
+
+unsafe impl<T> Send for ThreadCrosser<T> {}
+
+#[derive(Copy, Clone)]
+pub struct RustTestCase {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub skipped: bool,
+    /// If one or more tests are focused, only they will be executed. Helpful for debugging and working on specific features.
+    pub focused: bool,
+    /// Test only runs when the engine is in editor mode (`Engine::is_editor_hint() == true`).
+    ///
+    /// Used for testing behavior specific to the editor, e.g. placeholder substitution for runtime classes.
+    /// Editor-only tests are skipped in non-editor runs, and non-editor tests are skipped in editor runs.
+    pub editor_only: bool,
+    #[allow(dead_code)]
+    pub line: u32,
+    pub function: fn(&TestContext),
+}
+
+#[derive(Copy, Clone)]
+pub struct AsyncRustTestCase {
+    pub name: &'static str,
+    pub file: &'static str,
+    pub skipped: bool,
+    /// If one or more tests are focused, only they will be executed. Helpful for debugging and working on specific features.
+    pub focused: bool,
+    /// See [`RustTestCase::editor_only`].
+    pub editor_only: bool,
+    #[allow(dead_code)]
+    pub line: u32,
+    pub function: fn(&TestContext) -> godot::task::TaskHandle,
+}
+
+#[derive(Copy, Clone)]
+pub struct RustBenchmark {
+    pub name: &'static str,
+    pub file: &'static str,
+    #[allow(dead_code)]
+    pub line: u32,
+    pub function: fn() -> BenchResult,
+}
+
+pub fn passes_filter(filters: &[String], test_name: &str) -> bool {
+    filters.is_empty() || filters.iter().any(|x| test_name.contains(x))
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Toolbox for tests
+
+/// Swaps panic hooks, to disable printing during expected panics. Also disables gdext's panic printing.
+pub fn suppress_panic_log<R>(callback: impl FnOnce() -> R) -> R {
+    // DISABLE following lines to *temporarily* debug panics.
+    // Note that they currently print "itest `{}` failed", even if the test doesn't fail (which isn't usually relevant in suppressed mode).
+    let prev_hook = panic::take_hook();
+    panic::set_hook(Box::new(
+        |_panic_info| { /* suppress panic hook; do nothing */ },
+    ));
+
+    // Keep following lines.
+    let prev_print_level =
+        godot::private::set_error_print_level(godot::private::ErrorPrintLevel::Silent);
+    let res = callback();
+    godot::private::set_error_print_level(prev_print_level);
+
+    // DISABLE following line to *temporarily* debug panics.
+    panic::set_hook(prev_hook);
+
+    res
+}
+
+pub fn expect_panic(context: &str, code: impl FnOnce()) {
+    // Generally, types should be unwind safe, and this helps ergonomics in testing (especially around &mut in expect_panic closures).
+    let code = panic::AssertUnwindSafe(code);
+    let panic = suppress_panic_log(move || panic::catch_unwind(code));
+
+    assert!(
+        panic.is_err(),
+        "code should have panicked but did not: {context}",
+    );
+}
+
+/// Like [`expect_panic()`], but additionally silences Godot's error prints during the panicking call.
+///
+/// Use when the panicking code path also emits Godot errors (e.g. FFI access checks, errors emitted during unwind drops) that would otherwise
+/// spam the test output. Prefer plain [`expect_panic()`] when no Godot errors are expected, to avoid accidentally swallowing unrelated errors.
+pub fn expect_panic_quiet(context: &str, code: impl FnOnce()) {
+    // Future: could wire this up with Logger class, intercept output and check for containing an "expected" string.
+    // This would make expected errors visible in tests, and catch changes on Godot side. Possibly some maintenance if Godot error changes.
+    suppress_godot_print(|| expect_panic(context, code));
+}
+
+/// Run for code that should panic in *strict* and *balanced* safeguard levels, but cause UB in *disengaged* level.
+///
+/// The code is not executed for the latter.
+pub fn expect_panic_or_ub(_context: &str, _code: impl FnOnce()) {
+    #[cfg(safeguards_balanced)]
+    expect_panic(_context, _code);
+}
+
+/// Run for code that should panic in *strict* and *balanced* safeguard levels, but do nothing in *disengaged* level.
+///
+/// The code is executed either way, and must not cause UB.
+pub fn expect_panic_or_nothing(_context: &str, code: impl FnOnce()) {
+    #[cfg(safeguards_balanced)]
+    expect_panic(_context, code);
+
+    #[cfg(not(safeguards_balanced))]
+    code()
+}
+
+pin_project_lite::pin_project! {
+    pub struct ExpectPanicFuture<T: std::future::Future> {
+        context: &'static str,
+        #[pin]
+        future: T,
+    }
+}
+
+impl<T: std::future::Future> std::future::Future for ExpectPanicFuture<T> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let projection = self.project();
+        let future = projection.future;
+
+        // Run code that should panic, restore hook + gdext panic printing.
+        let panic = suppress_panic_log(move || {
+            panic::catch_unwind(panic::AssertUnwindSafe(move || future.poll(cx)))
+        });
+
+        match panic {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(_) => std::task::Poll::Ready(()),
+            Ok(std::task::Poll::Ready(_)) => {
+                panic!(
+                    "code should have panicked but did not: {}",
+                    projection.context
+                );
+            }
+        }
+    }
+}
+
+pub fn expect_async_panic<T: std::future::Future>(
+    context: &'static str,
+    future: T,
+) -> ExpectPanicFuture<T> {
+    ExpectPanicFuture { context, future }
+}
+
+/// Run code asynchronously, at the very start of the next _process_ frame (before `INode::process()`).
+///
+/// If there is a custom `MainLoop` present, it will be run _before_ this.
+///
+/// Useful for assertions that run expect a `call_deferred()` or similar operation, and still want to check the result.
+#[must_use]
+#[allow(dead_code)] // not yet used.
+pub fn next_frame<F>(code: F) -> godot::task::TaskHandle
+where
+    F: FnOnce() + 'static,
+{
+    let tree = Engine::singleton()
+        .get_main_loop()
+        .unwrap()
+        .cast::<SceneTree>();
+
+    godot::task::spawn(async move {
+        let _: () = tree.signals().process_frame().to_future().await;
+        code();
+    })
+}
+
+/// Synchronously run a thread and return result. Panics are propagated to caller thread.
+#[track_caller]
+pub fn quick_thread<R, F>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let handle = std::thread::spawn(f);
+    match handle.join() {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                panic!("quick_thread panicked: {s}")
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                panic!("quick_thread panicked: {s}")
+            } else {
+                panic!("quick_thread panicked with unknown type.")
+            };
+        }
+    }
+}
+
+/// Disable printing errors from Godot while running `f`, restoring afterwards (panic-safe via RAII).
+///
+/// Ideally we should catch and handle errors, ensuring they happen when expected. But that isn't always possible,
+/// so for now we can just disable printing the error to avoid spamming the terminal when tests should error.
+pub fn suppress_godot_print<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = godot::global::suppress_godot_errors();
+    f()
+}
+
+/// Some tests are disabled, as they rely on Godot checks which are only available in Debug builds.
+/// See <https://github.com/godotengine/godot/issues/86264>.
+pub fn runs_release() -> bool {
+    !Os::singleton().is_debug_build()
+}
+
+/// Whether we are running in GitHub Actions CI.
+///
+/// Must not be used to influence test logic. Only for logging and diagnostics.
+#[allow(dead_code)]
+pub fn runs_github_ci() -> bool {
+    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+}
+
+/// Create a `GDScript` script from code, compiles and returns it.
+pub fn create_gdscript(code: &str) -> Gd<GDScript> {
+    let mut script = GDScript::new_gd();
+    script.set_source_code(code);
+    script.reload(); // Necessary so compile is triggered.
+    script
+}
+
+/// Asserts that `value`'s `Debug` output is `<ty> { <fields> }`, the format used by objects and variants.
+#[track_caller]
+pub fn assert_debug_eq(value: impl std::fmt::Debug, ty: &str, fields: &str) {
+    assert_eq!(format!("{value:?}"), format!("{ty} {{ {fields} }}"));
+}
+
+/// Workaround for tests of the form `assert!(a == a)`.
+///
+/// We can't always use `assert_eq!(a, a)` because of lacking `Debug` impl.
+///
+/// Clippy however complains, yet the suggested `#[allow(clippy::eq_op)]` cannot be used to suppress the Clippy warning (likely a bug).
+#[macro_export]
+macro_rules! assert_eq_self {
+    ($a:expr_2021) => {{
+        if !($a == $a) {
+            panic!("assertion failed: `(a == a)`");
+        }
+    }};
+}
+
+pub use crate::{assert_eq_self, assert_match};
+
+/// Asserts that `$expr` matches `$pat` and introduces the bindings from `$pat` into the surrounding scope.
+/// On failure, panics with either a default message (showing the value via `Debug`) or a custom message.
+///
+/// # Examples
+/// ```
+/// # use crate::assert_match;
+/// struct Point { x: i32, y: i32 }
+/// let point = Some(Point { x: 1, y: 2 });
+/// assert_match!(point, Some(Point { x, y }), "expected Point");
+/// assert_eq!(x, 1);
+/// assert_eq!(y, 2);
+/// ```
+/// ```should_panic
+/// # use crate::assert_match;
+/// // This will panic.
+/// let value = None::<i32>;
+/// assert_match!(value, Some(_));
+/// ```
+#[macro_export]
+macro_rules! assert_match {
+    // Default message, show the unexpected value (requires Debug).
+    ($expr:expr_2021, $pat:pat $(,)?) => {
+        let __expr = $expr;
+        let $pat = __expr else {
+            panic!(
+                "assert_match! failed: expected {}, got {__expr:?}",
+                stringify!($pat),
+            );
+        };
+    };
+
+    // Custom panic message (format args supported).
+    ($expr:expr_2021, $pat:pat, $($arg:tt)+) => {
+        let __expr = $expr;
+        let $pat = __expr else {
+            panic!($($arg)+);
+        };
+    };
+}

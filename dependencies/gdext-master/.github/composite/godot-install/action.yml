@@ -1,0 +1,72 @@
+# Copyright (c) godot-rust; Bromeon and contributors.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: godot
+description: "Run Godot integration tests"
+
+inputs:
+  artifact-name:
+    required: true
+    description: "Name of the compiled Godot artifact to download"
+
+  godot-binary:
+    required: true
+    description: "Filename of the Godot executable"
+
+
+runs:
+  using: "composite"
+  steps:
+    # Do not check out here, as this would overwrite (clean) the current directory and is already done by the parent workflow.
+
+    # Replaces also backspaces on Windows, since they cause problems in Bash
+    - name: "Store variable to Godot binary"
+      run: |
+        runnerDir=$(echo "${{ runner.temp }}" | sed "s!\\\\!/!")
+        echo "RUNNER_DIR=$runnerDir" >> $GITHUB_ENV
+        echo "GDRUST_GODOT_BIN=$runnerDir/godot_bin/${{ inputs.godot-binary }}" >> $GITHUB_ENV
+      shell: bash
+
+#    - name: "Check cache for installed Godot version"
+#      id: "cache-godot"
+#      uses: actions/cache@v5
+#      with:
+#        path: ${{ runner.temp }}/godot_bin
+#        key: ${{ inputs.artifact-name }}-v${{ inputs.godot-ver }}
+#      shell: bash
+
+    - name: "Download Godot artifact"
+      env:
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+#      if: steps.cache-godot.outputs.cache-hit != 'true'
+      run: |
+        if [[ $ARTIFACT_NAME == *"nightly"* ]]; then
+          url="https://nightly.link/Bromeon/godot4-nightly/workflows/compile-godot-nightly/master/$ARTIFACT_NAME.zip"
+          # If a specific Godot revision should be used, rather than latest, use this:
+          # url="https://nightly.link/Bromeon/godot4-nightly/actions/runs/<WORKFLOW_RUN_ID>/$ARTIFACT_NAME.zip"
+        else
+          url="https://nightly.link/Bromeon/godot4-nightly/workflows/compile-godot-stable/master/$ARTIFACT_NAME.zip"
+        fi
+        
+        # nightly.link occasionally returns an HTTP 200 with a small error/redirect page instead of the artifact, which curl
+        # treats as success but then fails to unzip. So we check unzip's exit code and re-download corrupt archives.
+        # `--retry-all-errors` covers transient curl failures (e.g. recv error 56), which default `--retry` (timeouts, HTTP 5xx) misses.
+        # `-o` overwrites without prompting, so a partial extract from a failed attempt can't hang the retry on a "replace?" prompt.
+        for delay in 5 15 30 60 90 ""; do
+          curl "$url" -Lo artifact.zip \
+            --retry 3 \
+            --retry-delay 3 \
+            --retry-all-errors \
+            --connect-timeout 10
+          unzip -oq artifact.zip -d $RUNNER_DIR/godot_bin && break
+          [[ -z "$delay" ]] && { echo "::error::Failed to download a valid Godot artifact."; exit 1; }
+          sleep "$delay"
+        done
+      shell: bash
+
+    - name: "Prepare Godot executable"
+      run: |
+        chmod +x $GDRUST_GODOT_BIN
+      shell: bash

@@ -1,0 +1,761 @@
+/*
+ * Copyright (c) godot-rust; Bromeon and contributors.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use std::time::{Duration, Instant};
+
+use godot::builtin::{Array, Callable, GString, VarArray, Variant, vslice};
+use godot::classes::{Engine, Node, Os};
+use godot::global::godot_error;
+use godot::obj::{Gd, Singleton};
+use godot::register::{GodotClass, godot_api};
+
+use super::AsyncRustTestCase;
+use crate::framework::{
+    BenchResult, RustBenchmark, RustTestCase, TestContext, bencher, is_anchor, passes_filter,
+};
+
+#[derive(Debug, Clone, Default)]
+struct TestStats {
+    total: usize,
+    passed: usize,
+    skipped: usize,
+    failed_list: Vec<String>,
+}
+
+#[derive(GodotClass, Debug)]
+#[class(init)]
+pub struct IntegrationTests {
+    stats: TestStats,
+}
+
+#[godot_api]
+impl IntegrationTests {
+    #[allow(clippy::uninlined_format_args)]
+    #[allow(clippy::too_many_arguments)]
+    #[func]
+    fn run_all_tests(
+        &mut self,
+        gdscript_tests: VarArray,
+        gdscript_file_count: i64,
+        allow_focus: bool,
+        gdscript_focused: bool,
+        scene_tree: Gd<Node>,
+        filters: VarArray,
+        property_tests: Gd<Node>,
+        on_finished: Callable,
+    ) {
+        println!("{}Run{} Godot integration tests...", FMT_CYAN_BOLD, FMT_END);
+        let filters: Vec<String> = filters.iter_shared().map(|v| v.to::<String>()).collect();
+        let gdscript_tests = gdscript_tests
+            .iter_shared()
+            .filter(|test| {
+                let test_name = get_property(test, "method_name");
+                passes_filter(filters.as_slice(), &test_name)
+            })
+            .collect::<Array<_>>();
+
+        let rust_test_cases = collect_rust_tests(&filters);
+
+        let rust_focused = rust_test_cases.focused_run;
+        let focused = rust_focused || gdscript_focused;
+
+        // If the other side is focused (and this side is not), skip this side entirely.
+        let run_rust = !gdscript_focused || rust_focused;
+        let run_gdscript = !rust_focused || gdscript_focused;
+
+        // Print focus/count header.
+        let focus_which = match (rust_focused, gdscript_focused) {
+            (false, false) => None,
+            (true, false) => Some("Rust"),
+            (false, true) => Some("GDScript"),
+            (true, true) => Some("Rust and GDScript"),
+        };
+        if let Some(which) = focus_which {
+            println!("  {FMT_CYAN}Focused run{FMT_END} -- execute only selected {which} tests.");
+        }
+        if run_rust {
+            println!(
+                "  Rust: found {} tests in {} files.",
+                rust_test_cases.rust_test_count, rust_test_cases.rust_file_count
+            );
+        }
+        if run_gdscript {
+            println!(
+                "  GDScript: found {} tests in {} files.",
+                gdscript_tests.len(),
+                gdscript_file_count
+            );
+        }
+
+        let (rust_tests, async_rust_tests) = if run_rust {
+            (rust_test_cases.rust_tests, rust_test_cases.async_rust_tests)
+        } else {
+            (vec![], vec![])
+        };
+
+        let clock = Instant::now();
+        self.run_rust_tests(rust_tests, scene_tree.clone(), property_tests.clone());
+        let rust_time = clock.elapsed();
+
+        let gdscript_time = if run_gdscript {
+            let extra_duration = self.run_gdscript_tests(gdscript_tests);
+            Some((clock.elapsed() - rust_time, extra_duration))
+        } else {
+            None
+        };
+
+        {
+            let stats = self.stats.clone();
+
+            let on_finalize_test = move |stats, property_tests: Gd<Node>| {
+                let gdscript_elapsed = gdscript_time
+                    .as_ref()
+                    .map(|gdtime| gdtime.0)
+                    .unwrap_or_default();
+
+                let rust_async_time = clock.elapsed() - rust_time - gdscript_elapsed;
+
+                property_tests.free();
+
+                let result = Self::conclude_tests(
+                    &stats,
+                    rust_time + rust_async_time,
+                    gdscript_time.map(|(elapsed, extra)| elapsed + extra),
+                    focused,
+                    allow_focus,
+                );
+
+                // Calling deferred to break a potentially synchronous call stack and avoid re-entrancy.
+                on_finished.call_deferred(vslice![result]);
+            };
+
+            Self::run_async_rust_tests(
+                stats,
+                async_rust_tests,
+                scene_tree,
+                property_tests,
+                on_finalize_test,
+            );
+        }
+    }
+
+    /// Queried by some `.gd` tests to check whether they can call into conditionally-compiled Rust classes.
+    #[func]
+    fn is_full_codegen() -> bool {
+        cfg!(feature = "codegen-full")
+    }
+
+    /// Returns whether all benchmarks completed without error.
+    #[allow(clippy::uninlined_format_args)]
+    #[func]
+    fn run_all_benchmarks(&mut self, scene_tree: Gd<Node>, filters: VarArray) -> bool {
+        println!("\n{}Run{} Godot benchmarks...", FMT_CYAN_BOLD, FMT_END);
+
+        let filters: Vec<String> = filters.iter_shared().map(|v| v.to::<String>()).collect();
+        let (benchmarks, rust_file_count) = super::collect_rust_benchmarks(filters.as_slice());
+        println!(
+            "  Rust: found {} benchmarks in {} files.",
+            benchmarks.len(),
+            rust_file_count
+        );
+
+        let clock = Instant::now();
+        let results = self.run_rust_benchmarks(&benchmarks, scene_tree);
+        let total_time = clock.elapsed();
+
+        self.print_rust_benchmarks(&benchmarks, &results);
+        self.conclude_benchmarks(&benchmarks, &results, total_time)
+    }
+
+    fn warn_if_debug(&self) {
+        let rust_debug = cfg!(debug_assertions);
+        let godot_debug = Os::singleton().is_debug_build();
+
+        let what = match (rust_debug, godot_debug) {
+            (true, true) => Some("both Rust and Godot engine use debug builds"),
+            (true, false) => Some("Rust uses a debug build"),
+            (false, true) => Some("Godot engine uses a debug build"),
+            (false, false) => None,
+        };
+
+        if let Some(what) = what {
+            println!("{FMT_YELLOW}Warning: {what}, benchmarks may not be expressive.{FMT_END}");
+        }
+    }
+
+    fn run_rust_tests(
+        &mut self,
+        tests: Vec<RustTestCase>,
+        scene_tree: Gd<Node>,
+        property_tests: Gd<Node>,
+    ) {
+        let ctx = TestContext {
+            scene_tree,
+            property_tests,
+        };
+
+        let mut last_file = None;
+        for test in tests {
+            print_test_pre(test.name, test.file, last_file.as_deref(), false);
+            last_file = Some(test.file.to_string());
+
+            let outcome = run_rust_test(&test, &ctx);
+
+            Self::update_stats(&mut self.stats, &outcome, test.file, test.name);
+            print_test_post(test.name, outcome);
+        }
+    }
+
+    fn run_async_rust_tests(
+        stats: TestStats,
+        tests: Vec<AsyncRustTestCase>,
+        scene_tree: Gd<Node>,
+        property_tests: Gd<Node>,
+        on_finalize_test: impl FnOnce(TestStats, Gd<Node>) + 'static,
+    ) {
+        let mut tests_iter = tests.into_iter();
+
+        let Some(first_test) = tests_iter.next() else {
+            return on_finalize_test(stats, property_tests);
+        };
+
+        let ctx = TestContext {
+            scene_tree,
+            property_tests,
+        };
+
+        Self::run_async_rust_tests_step(tests_iter, first_test, ctx, stats, None, on_finalize_test);
+    }
+
+    fn run_async_rust_tests_step(
+        mut tests_iter: impl Iterator<Item = AsyncRustTestCase> + 'static,
+        test: AsyncRustTestCase,
+        ctx: TestContext,
+        mut stats: TestStats,
+        mut last_file: Option<String>,
+        on_finalize_test: impl FnOnce(TestStats, Gd<Node>) + 'static,
+    ) {
+        print_test_pre(test.name, test.file, last_file.as_deref(), true);
+        last_file.replace(test.file.to_string());
+
+        run_async_rust_test(&test, &ctx.clone(), move |outcome| {
+            Self::update_stats(&mut stats, &outcome, test.file, test.name);
+            print_test_post(test.name, outcome);
+
+            if let Some(next) = tests_iter.next() {
+                return Self::run_async_rust_tests_step(
+                    tests_iter,
+                    next,
+                    ctx,
+                    stats,
+                    last_file,
+                    on_finalize_test,
+                );
+            }
+
+            on_finalize_test(stats, ctx.property_tests);
+        });
+    }
+
+    fn run_gdscript_tests(&mut self, tests: VarArray) -> Duration {
+        let mut last_file = None;
+        let mut extra_duration = Duration::new(0, 0);
+
+        for test in tests.iter_shared() {
+            let test_file = get_property(&test, "suite_name");
+            let test_case = get_property(&test, "method_name");
+
+            print_test_pre(&test_case, &test_file, last_file.as_deref(), true);
+
+            last_file = Some(test_file.clone());
+
+            // If GDScript invokes Rust code that fails, the panic would break through; catch it.
+            // TODO(bromeon): use try_call() once available.
+            let result = std::panic::catch_unwind(|| test.call("run", &[]));
+
+            // In case a test needs to disable error messages, to ensure it runs properly.
+            Engine::singleton().set_print_error_messages(true);
+
+            if let Some(duration) = get_execution_time(&test) {
+                extra_duration += duration;
+            }
+
+            let outcome = match result {
+                Ok(result) => {
+                    let success = result.try_to::<bool>().unwrap_or_else(|_| {
+                        // Not a failing test, but an error in the test setup.
+                        panic!("GDScript test case {test} returned non-bool: {result}")
+                    });
+
+                    for error in get_errors(&test).iter_shared() {
+                        godot_error!("{error}");
+                    }
+                    TestOutcome::from_bool(success)
+                }
+                Err(e) => {
+                    // TODO(bromeon) should this be a fatal error, i.e. panicking and aborting tests -> bad test setup?
+                    // If GDScript receives panics, this can also happen in user code that is _not_ invoked from Rust, and thus a panic
+                    // could not be caught, causing UB at the Godot FFI boundary (in practice, this will be a defined Godot crash with
+                    // stack trace though).
+                    godot_error!("GDScript test panicked");
+                    godot::private::extract_panic_message(&e);
+                    TestOutcome::Failed
+                }
+            };
+
+            Self::update_stats(&mut self.stats, &outcome, &test_file, &test_case);
+            print_test_post(&test_case, outcome);
+        }
+        extra_duration
+    }
+
+    fn conclude_tests(
+        stats: &TestStats,
+        rust_time: Duration,
+        gdscript_time: Option<Duration>,
+        focused_run: bool,
+        allow_focus: bool,
+    ) -> bool {
+        let TestStats {
+            total,
+            passed,
+            skipped,
+            ..
+        } = stats;
+
+        // Consider 0 tests run as a failure too, because it's probably a problem with the run itself.
+        let failed = total - passed - skipped;
+        let all_passed = failed == 0 && *total != 0;
+
+        let outcome = TestOutcome::from_bool(all_passed);
+
+        let rust_time = rust_time.as_secs_f32();
+        let gdscript_time = gdscript_time.map(|t| t.as_secs_f32());
+
+        let extra = if *skipped > 0 {
+            format!(", {skipped} skipped")
+        } else if focused_run {
+            " (focused run)".to_string()
+        } else {
+            "".to_string()
+        };
+
+        println!("\nTest result: {outcome}. {passed} passed; {failed} failed{extra}.");
+        if let Some(gdscript_time) = gdscript_time {
+            let total_time = rust_time + gdscript_time;
+            println!(
+                "  Time: {total_time:.2}s.  (Rust {rust_time:.2}s, GDScript {gdscript_time:.2}s)"
+            );
+        } else {
+            println!("  Time: {rust_time:.2}s.");
+        }
+
+        if !all_passed {
+            println!("\n  Failed tests:");
+            let max = 10;
+            for test in stats.failed_list.iter().take(max) {
+                println!("  * {test}");
+            }
+
+            if stats.failed_list.len() > max {
+                println!("  * ... and {} more.", stats.failed_list.len() - max);
+            }
+
+            println!();
+        }
+
+        if focused_run && !allow_focus {
+            println!("  {FMT_YELLOW}Focus run disallowed; return failure.{FMT_END}");
+            false
+        } else {
+            all_passed
+        }
+    }
+
+    /// Returns the merged result of each benchmark, in the order they were passed in.
+    fn run_rust_benchmarks(
+        &mut self,
+        benchmarks: &[RustBenchmark],
+        _scene_tree: Gd<Node>,
+    ) -> Vec<BenchResult> {
+        // let ctx = TestContext { scene_tree };
+
+        // Passes are interleaved rather than run back-to-back per benchmark, so that a transient hits all benchmarks alike.
+        // Nothing is printed during measurement, as the output is grouped per benchmark, not per pass.
+        let mut passes: Vec<Vec<BenchResult>> = (0..benchmarks.len()).map(|_| vec![]).collect();
+        for _ in 0..bencher::PASSES {
+            for (bench, results) in benchmarks.iter().zip(passes.iter_mut()) {
+                results.push(run_rust_benchmark(bench));
+            }
+        }
+
+        passes.into_iter().map(merge_bench_passes).collect()
+    }
+
+    fn print_rust_benchmarks(&self, benchmarks: &[RustBenchmark], results: &[BenchResult]) {
+        // Padding must match print_bench_pre()'s prefix: "   -- " + name + " ...".
+        let prefix_width = 6 + COL_W_NAME + 4;
+        print!("\n{FMT_CYAN}{space}", space = " ".repeat(prefix_width));
+        for metrics in bencher::metrics() {
+            let header = format!("{metrics} [ns]");
+            print!(" {header:>width$}", width = COL_W_TIME + COL_W_DECIMAL);
+        }
+        print!("{FMT_END}");
+
+        let mut last_file = None;
+        for (bench, result) in benchmarks.iter().zip(results) {
+            print_bench_pre(bench.name, bench.file, last_file.as_deref());
+            last_file = Some(bench.file.to_string());
+
+            print_bench_post(result);
+        }
+    }
+
+    /// Returns whether all benchmarks succeeded.
+    fn conclude_benchmarks(
+        &self,
+        benchmarks: &[RustBenchmark],
+        results: &[BenchResult],
+        total_time: Duration,
+    ) -> bool {
+        let secs = total_time.as_secs_f32();
+        println!("\nBenchmarks completed in {secs:.2}s.");
+
+        // Anchors measure plain Rust code, so their spread is what this machine adds to every other number in the table.
+        // Only within one run: code layout is fixed per binary, so a build-to-build comparison needs the anchors' absolute times.
+        let mut floor: Option<f64> = None;
+        for (bench, result) in benchmarks.iter().zip(results) {
+            let Ok(measured) = result else { continue };
+
+            if is_anchor(bench.name) && measured.pass_spread.is_finite() {
+                floor = Some(floor.unwrap_or(0.0).max(measured.pass_spread));
+            }
+        }
+
+        if let Some(floor) = floor {
+            let percent = floor * 100.0;
+            println!(
+                "  Run-to-run floor (anchors): {percent:.1}%; smaller differences within this run mean nothing."
+            );
+            println!(
+                "  Comparing two builds: benchmark diff < anchor diff means noise, not a real change."
+            );
+            println!();
+        }
+
+        let failed_count = results.iter().filter(|result| result.is_err()).count();
+        if failed_count > 0 {
+            println!("  {FMT_RED}{failed_count} benchmark(s) failed.{FMT_END}");
+        }
+
+        self.warn_if_debug(); // Printed last, before check.sh warnings.
+
+        failed_count == 0
+    }
+
+    fn update_stats(
+        stats: &mut TestStats,
+        outcome: &TestOutcome,
+        test_file: &str,
+        test_name: &str,
+    ) {
+        stats.total += 1;
+        match outcome {
+            TestOutcome::Passed => stats.passed += 1,
+            TestOutcome::Failed => stats.failed_list.push(format!(
+                "{} > {}",
+                extract_file_subtitle(test_file),
+                test_name
+            )),
+            TestOutcome::Skipped => stats.skipped += 1,
+        }
+    }
+}
+
+// Column widths for benchmark table.
+const COL_W_NAME: usize = 30;
+const COL_W_TIME: usize = 11;
+const COL_W_DECIMAL: usize = 3;
+
+// For more colors, see https://stackoverflow.com/a/54062826
+// To experiment with colors, add `rand` dependency and add following code above.
+//     use rand::seq::SliceRandom;
+//     let outcome = [TestOutcome::Passed, TestOutcome::Failed, TestOutcome::Skipped];
+//     let outcome = outcome.choose(&mut rand::thread_rng()).unwrap();
+const FMT_CYAN_BOLD: &str = "\x1b[36;1;1m";
+const FMT_CYAN: &str = "\x1b[36m";
+const FMT_GREEN: &str = "\x1b[32m";
+const FMT_YELLOW: &str = "\x1b[33m"; // sometimes orange.
+const FMT_YELLOW_BRIGHT: &str = "\x1b[93m";
+const FMT_RED: &str = "\x1b[31m";
+const FMT_END: &str = "\x1b[0m";
+
+fn run_rust_test(test: &RustTestCase, ctx: &TestContext) -> TestOutcome {
+    if test.skipped {
+        return TestOutcome::Skipped;
+    }
+
+    // This will appear in all panics, but those inside expect_panic() are suppressed.
+    // So the "itest failed" message will only appear for unexpected panics, where tests indeed fail.
+    let err_context = format!("itest `{}` failed", test.name);
+
+    // Explicit type to prevent tests from returning a value.
+    let success: Result<(), _> =
+        godot::private::handle_panic(&err_context, || (test.function)(ctx));
+
+    TestOutcome::from_bool(success.is_ok())
+}
+
+/// Merges the passes of one benchmark, propagating the first error if any pass failed.
+fn merge_bench_passes(passes: Vec<BenchResult>) -> BenchResult {
+    passes
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map(bencher::merge_passes)
+}
+
+/// A panicking benchmark is turned into an `Err`, so it fails the run instead of unwinding into Godot.
+fn run_rust_benchmark(bench: &RustBenchmark) -> BenchResult {
+    let err_context = format!("benchmark `{}` failed", bench.name);
+
+    match godot::private::handle_panic(&err_context, bench.function) {
+        Ok(result) => result,
+        Err(_) => Err("panicked".to_string()),
+    }
+}
+
+fn run_async_rust_test(
+    test: &AsyncRustTestCase,
+    ctx: &TestContext,
+    on_test_finished: impl FnOnce(TestOutcome) + 'static,
+) {
+    if test.skipped {
+        return on_test_finished(TestOutcome::Skipped);
+    }
+
+    // Explicit type to prevent tests from returning a value
+    let err_context = format!("itest `{}` failed", test.name);
+    let success: Result<godot::task::TaskHandle, _> =
+        godot::private::handle_panic(&err_context, || (test.function)(ctx));
+
+    let Ok(task_handle) = success else {
+        return on_test_finished(TestOutcome::Failed);
+    };
+
+    check_async_test_task(task_handle, on_test_finished, ctx);
+}
+
+fn check_async_test_task(
+    task_handle: godot::task::TaskHandle,
+    on_test_finished: impl FnOnce(TestOutcome) + 'static,
+    ctx: &TestContext,
+) {
+    use godot::classes::object::ConnectFlags;
+    use godot::task::has_godot_task_panicked;
+
+    if !task_handle.is_pending() {
+        on_test_finished(TestOutcome::from_bool(!has_godot_task_panicked(
+            task_handle,
+        )));
+
+        return;
+    }
+
+    let next_ctx = ctx.clone();
+    let mut callback = Some(on_test_finished);
+    let mut probably_task_handle = Some(task_handle);
+
+    let deferred = Callable::from_fn("run_async_rust_test", move |_| {
+        check_async_test_task(
+            probably_task_handle
+                .take()
+                .expect("Callable will only be called once!"),
+            callback
+                .take()
+                .expect("Callable should not be called multiple times!"),
+            &next_ctx,
+        );
+    });
+
+    ctx.scene_tree
+        .get_tree()
+        .connect_flags("process_frame", &deferred, ConnectFlags::ONE_SHOT);
+}
+
+fn print_test_pre(test_case: &str, test_file: &str, last_file: Option<&str>, flush: bool) {
+    print_file_header(test_file, last_file);
+
+    print!("   -- {test_case} ... ");
+    if flush {
+        // Flush in GDScript, because its own print may come sooner than Rust prints otherwise.
+        // (Strictly speaking, this can also happen from Rust, when Godot prints something. So far, it didn't though...)
+        use std::io::Write;
+        std::io::stdout().flush().expect("flush stdout");
+    }
+}
+
+fn print_file_header(file: &str, last_file: Option<&str>) {
+    // Check if we need to open a new category for a file.
+    let print_file = last_file != Some(file);
+
+    if print_file {
+        println!("\n   {}:", extract_file_subtitle(file));
+    }
+}
+
+fn extract_file_subtitle(file: &str) -> &str {
+    if let Some(sep_pos) = file.rfind(['/', '\\']) {
+        &file[sep_pos + 1..]
+    } else {
+        file
+    }
+}
+
+/// Prints a test name and its outcome.
+///
+/// Note that this is run after a test run, so stdout/stderr output during the test will be printed before.
+/// It would be possible to print the test name before and the outcome after, but that would split or duplicate the line.
+fn print_test_post(test_case: &str, outcome: TestOutcome) {
+    // If test failed, something was printed (e.g. assertion), so we can print the entire line again; otherwise just outcome on same line.
+    if matches!(outcome, TestOutcome::Failed) {
+        println!("   -- {test_case} ... {outcome}");
+    } else {
+        println!("{outcome}");
+    }
+}
+
+fn print_bench_pre(benchmark: &str, bench_file: &str, last_file: Option<&str>) {
+    print_file_header(bench_file, last_file);
+
+    let benchmark = if benchmark.len() > COL_W_NAME {
+        &benchmark[..COL_W_NAME]
+    } else {
+        benchmark
+    };
+
+    print!("   -- {benchmark:<COL_W_NAME$} ...");
+}
+
+/// Formats nanoseconds, grouping digits by thousands. Decimals only below 100ns, where they still carry information.
+fn format_time(nanos: f64) -> String {
+    let decimals = match nanos {
+        n if n < 10.0 => 2,
+        n if n < 100.0 => 1,
+        _ => 0,
+    };
+
+    let text = format!("{nanos:.decimals$}");
+    let (integer, fraction) = match text.split_once('.') {
+        Some((integer, fraction)) => (integer, format!(".{fraction}")),
+        None => (text.as_str(), String::new()),
+    };
+
+    let mut grouped = String::new();
+    for (i, digit) in integer.chars().enumerate() {
+        if i > 0 && (integer.len() - i) % 3 == 0 {
+            grouped.push('\'');
+        }
+        grouped.push(digit);
+    }
+
+    format!("{grouped:>COL_W_TIME$}{fraction:<COL_W_DECIMAL$}")
+}
+
+fn print_bench_post(result: &BenchResult) {
+    match result {
+        Ok(measured) => {
+            for stat in measured.stats.iter() {
+                print!(" {}", format_time(*stat));
+            }
+            if measured.noisy {
+                print!("    {FMT_YELLOW_BRIGHT}~noisy{FMT_END}");
+            }
+        }
+        Err(msg) => {
+            print!("   {FMT_RED}ERROR: {msg}{FMT_END}");
+        }
+    }
+
+    println!();
+}
+
+fn get_property(test: &Variant, property: &str) -> String {
+    test.call("get", vslice![property]).to::<String>()
+}
+
+fn get_execution_time(test: &Variant) -> Option<Duration> {
+    let seconds = test
+        .call("get", vslice!["execution_time_seconds"])
+        .try_to::<f64>()
+        .ok()?;
+
+    Some(Duration::from_secs_f64(seconds))
+}
+
+fn get_errors(test: &Variant) -> Array<GString> {
+    test.call("get", vslice!["errors"])
+        .try_to::<Array<GString>>()
+        .unwrap_or_default()
+}
+
+struct RustTestCases {
+    rust_tests: Vec<RustTestCase>,
+    async_rust_tests: Vec<AsyncRustTestCase>,
+    rust_test_count: usize,
+    rust_file_count: usize,
+    focused_run: bool,
+}
+
+fn collect_rust_tests(filters: &[String]) -> RustTestCases {
+    let (mut rust_tests, mut rust_files, focused_run) = super::collect_rust_tests(filters);
+
+    let (async_rust_tests, async_rust_files, async_focused_run) =
+        super::collect_async_rust_tests(filters, focused_run);
+
+    if !focused_run && async_focused_run {
+        rust_tests.clear();
+        rust_files.clear();
+    }
+
+    let rust_test_count = rust_tests.len() + async_rust_tests.len();
+    let rust_file_count = rust_files.union(&async_rust_files).count();
+
+    RustTestCases {
+        rust_tests,
+        async_rust_tests,
+        rust_test_count,
+        rust_file_count,
+        focused_run: focused_run || async_focused_run,
+    }
+}
+
+#[must_use]
+enum TestOutcome {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl TestOutcome {
+    fn from_bool(success: bool) -> Self {
+        if success { Self::Passed } else { Self::Failed }
+    }
+}
+
+impl std::fmt::Display for TestOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Do not use print_rich() from Godot, because it's very slow and significantly delays test execution.
+        let end = FMT_END;
+        let (col, outcome) = match self {
+            TestOutcome::Passed => (FMT_GREEN, "ok"),
+            TestOutcome::Failed => (FMT_RED, "FAILED"),
+            TestOutcome::Skipped => (FMT_YELLOW, "skipped"),
+        };
+
+        write!(f, "{col}{outcome}{end}")
+    }
+}

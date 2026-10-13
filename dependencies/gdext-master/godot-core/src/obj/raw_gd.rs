@@ -1,0 +1,921 @@
+/*
+ * Copyright (c) godot-rust; Bromeon and contributors.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use std::{fmt, ptr};
+
+use godot_ffi as sys;
+use sys::{ExtVariantType, GodotFfi, PtrcallType, interface_fn};
+
+use crate::builtin::{Variant, VariantType};
+#[cfg(safeguards_balanced)]
+use crate::meta::CallContext;
+use crate::meta::error::{ConvertError, FromVariantError};
+use crate::meta::shape::GodotShape;
+use crate::meta::{ClassId, FromGodot, GodotConvert, GodotFfiVariant, GodotType, RefArg, ToGodot};
+use crate::obj::bounds::{Declarer, DynMemory as _, Memory};
+use crate::obj::rtti::ObjectRtti;
+use crate::obj::{Bounds, Gd, GdDerefTarget, GdMut, GdRef, GodotClass, InstanceId, bounds};
+use crate::storage::{InstanceCache, InstanceStorage, Storage};
+use crate::{classes, meta, out};
+
+/// Low-level bindings for object pointers in Godot.
+///
+/// This should not be used directly, you should either use [`Gd<T>`](super::Gd) or [`Option<Gd<T>>`]
+/// depending on whether you need a nullable object pointer or not.
+#[repr(C)]
+#[doc(hidden)]
+pub struct RawGd<T: GodotClass> {
+    pub(super) obj: *mut T,
+
+    // Must not be changed after initialization.
+    cached_rtti: Option<ObjectRtti>,
+
+    // Direct access to InstanceStorage -- initially null.
+    // Only set for user-defined types; ZST otherwise.
+    cached_storage_ptr: <<T as Bounds>::Declarer as Declarer>::InstanceCache,
+}
+
+impl<T: GodotClass> RawGd<T> {
+    /// Initializes this `RawGd<T>` from the object pointer as a **weak ref**, meaning it does not
+    /// initialize/increment the reference counter.
+    ///
+    /// If `obj` is null or the instance ID query behind the object returns 0, the returned `RawGd<T>` will have the null state.
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be a valid object pointer or a null pointer.
+    pub(super) unsafe fn from_obj_sys_weak(obj: sys::GDExtensionObjectPtr) -> Self {
+        let rtti = if obj.is_null() {
+            None
+        } else {
+            let raw_id = unsafe { interface_fn!(object_get_instance_id)(obj) };
+
+            // This happened originally during Variant -> RawGd conversion, but at this point it's too late to detect, and UB has already
+            // occurred (the Variant holds the object pointer as bytes in an array, which becomes dangling the moment the actual object dies).
+            let instance_id = InstanceId::try_from_u64(raw_id)
+                .expect("null instance ID when constructing object; this very likely causes UB");
+
+            // TODO(bromeon): this should query dynamic type of object, which can be different from T (upcast, FromGodot, etc).
+            // See comment in ObjectRtti.
+            Some(ObjectRtti::of::<T>(instance_id))
+        };
+
+        Self {
+            obj: obj.cast::<T>(),
+            cached_rtti: rtti,
+            cached_storage_ptr: InstanceCache::null(),
+        }
+    }
+
+    /// Initializes this `RawGd<T>` from the object pointer as a **strong ref**, meaning it initializes
+    /// /increments the reference counter and keeps the object alive.
+    ///
+    /// This is the default for most initializations from FFI. In cases where reference counter
+    /// should explicitly **not** be updated, [`from_obj_sys_weak()`](Self::from_obj_sys_weak) is available.
+    ///
+    /// # Safety
+    ///
+    /// `obj` must be a valid object pointer or a null pointer.
+    pub(super) unsafe fn from_obj_sys(obj: sys::GDExtensionObjectPtr) -> Self {
+        unsafe { Self::from_obj_sys_weak(obj).with_inc_refcount() }
+    }
+
+    /// Returns `self` but with initialized ref-count.
+    fn with_inc_refcount(mut self) -> Self {
+        // Note: use refc_init() and not refc_inc(), since this might be the first reference increment.
+        // Godot expects RefCounted::init_ref to be called instead of RefCounted::reference in that case.
+        // init_ref also doesn't hurt (except 1 possibly unnecessary check).
+        self.refc_init();
+        self
+    }
+
+    /// Returns `true` if the object is null.
+    ///
+    /// This does not check if the object is dead. For that, use [`is_instance_valid()`](Self::is_instance_valid).
+    pub(crate) fn is_null(&self) -> bool {
+        self.obj.is_null() || self.cached_rtti.is_none()
+    }
+
+    /// Creates a null object pointer.
+    pub(crate) fn null() -> Self {
+        Self {
+            obj: ptr::null_mut(),
+            cached_rtti: None,
+            cached_storage_ptr: InstanceCache::null(),
+        }
+    }
+
+    pub(crate) fn instance_id_unchecked(&self) -> Option<InstanceId> {
+        self.cached_rtti.as_ref().map(|rtti| rtti.instance_id())
+    }
+
+    pub(crate) fn is_instance_valid(&self) -> bool {
+        self.cached_rtti
+            .as_ref()
+            .is_some_and(|rtti| rtti.instance_id().lookup_validity())
+    }
+
+    /// Checks whether `self` inherits from (or is) class `U`.
+    fn is_dynamic_class_of<U: GodotClass>(&self) -> bool {
+        self.is_dynamic_class(U::class_id())
+    }
+
+    /// Checks whether `self` inherits from (or is) class `U`.
+    pub(super) fn is_dynamic_class(&self, class: ClassId) -> bool {
+        // is_class() parameter changed from GString to StringName in Godot 4.7.
+        #[cfg(since_api = "4.7")]
+        let class_name = class.to_string_name();
+        #[cfg(before_api = "4.7")]
+        let class_name = class.to_gstring();
+
+        self.as_object_ref().is_class(&class_name)
+    }
+
+    /// Returns `Ok(cast_obj)` on success, `Err(self)` on error.
+    pub(super) fn owned_cast<U>(self) -> Result<RawGd<U>, Self>
+    where
+        U: GodotClass,
+    {
+        if self.is_null() {
+            // Null can be cast to anything; ref-count is irrelevant.
+            return Ok(RawGd::null());
+        }
+
+        // Before Godot API calls, make sure the object is alive (and in Debug mode, of the correct type).
+        // Current design decision: EVERY cast fails on incorrect type, even if target type is correct. This avoids the risk of violated
+        // invariants that leak to the Godot implementation. Also, we do not provide a way to recover from bad types -- this is always
+        // a bug that must be solved by the user.
+        self.check_rtti("cast");
+
+        if self.is_dynamic_class_of::<U>() {
+            // SAFETY: is_class() confirmed U is a valid type.
+            Ok(unsafe { self.into_reinterpreted() })
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Consumes `self` and reinterprets it as `RawGd<U>`, transferring ownership without changing the refcount.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the underlying object is a valid instance of `U`.
+    unsafe fn into_reinterpreted<U: GodotClass>(self) -> RawGd<U> {
+        let this = std::mem::ManuallyDrop::new(self);
+        let cached_rtti = this
+            .cached_rtti
+            .as_ref()
+            .map(|rtti| ObjectRtti::of::<U>(rtti.instance_id()));
+
+        // SAFETY: caller guarantees object is a valid `U`; `ManuallyDrop` suppresses Drop on the source,
+        // so the returned `RawGd<U>` takes sole ownership without a refcount change.
+        RawGd {
+            obj: this.obj.cast::<U>(),
+            cached_rtti,
+            cached_storage_ptr: InstanceCache::null(),
+        }
+    }
+
+    /// Returns the reference count, if the dynamic object inherits `RefCounted`; and `None` otherwise.
+    ///
+    /// Infallible (no problematic virtual dispatch during C++ construction/destruction). Debug-printing an object being destroyed still works.
+    pub(crate) fn maybe_refcount(&self) -> Option<usize> {
+        let instance_id = self.instance_id_unchecked()?;
+        if !instance_id.is_ref_counted() || self.obj.is_null() {
+            return None;
+        }
+
+        // SAFETY: object is non-null and dynamically ref-counted, as checked above.
+        let ref_count = unsafe { self.as_ref_counted().get_reference_count() };
+
+        Some(ref_count as usize)
+    }
+
+    /// Reinterprets this object as `RefCounted`, for the ref-count operations in this file.
+    ///
+    /// Unlike [`as_upcast_ref()`][Self::as_upcast_ref], this runs no liveness or type check, and a method invoked on the result need
+    /// not run one either (see `special_cases::is_class_method_unvalidated()` in godot-codegen). Skipping those is sound, since the
+    /// callers only run on a `RawGd` that already holds a strong-ref. Also covers `T=Object` with a dynamically ref-counted object.
+    ///
+    /// # Safety
+    /// Caller must guarantee that the dynamic object is ref-counted, and that `self` is non-null and a strong reference.
+    unsafe fn as_ref_counted(&self) -> &classes::RefCounted {
+        // SAFETY: layout reasoning as in as_upcast_ref(); RefCounted is an engine class.
+        unsafe { std::mem::transmute::<&Self, &classes::RefCounted>(self) }
+    }
+
+    /// # Safety
+    /// See [`as_ref_counted()`][Self::as_ref_counted].
+    unsafe fn as_ref_counted_mut(&mut self) -> &mut classes::RefCounted {
+        // SAFETY: layout reasoning as in as_upcast_mut(); RefCounted is an engine class.
+        unsafe { std::mem::transmute::<&mut Self, &mut classes::RefCounted>(self) }
+    }
+
+    /// Whether this object is non-null and ref-counted, i.e. the `refc_*` operations below have an effect.
+    ///
+    /// For `T=Object` this is a runtime query; for all other classes it's known statically and the branch compiles away.
+    fn is_ref_counted(&self) -> bool {
+        !self.is_null() && T::DynMemory::is_ref_counted(self) == Some(true)
+    }
+
+    /// Sets the reference count to 1, when this `RawGd` becomes the object's first ref; see Godot's `RefCounted::init_ref()`.
+    ///
+    /// Use [`refc_inc()`][Self::refc_inc] instead if the object is already referenced.
+    ///
+    /// No-op if `T` is not ref-counted. Panics if the object is already being destroyed (Godot's `bool` return is asserted).
+    fn refc_init(&mut self) {
+        if !self.is_ref_counted() {
+            return;
+        }
+
+        out!("  RawGd::refc_init: {self:?}");
+
+        // SAFETY: object is ref-counted, as checked above.
+        let success = unsafe { self.as_ref_counted_mut().init_ref() };
+        assert!(success, "RefCounted::init_ref() failed");
+    }
+
+    /// Increments the reference count, for objects which are already referenced.
+    ///
+    /// No-op if `T` is not ref-counted.
+    pub(crate) fn refc_inc(&mut self) {
+        if !self.is_ref_counted() {
+            return;
+        }
+
+        out!("  RawGd::refc_inc:  {self:?}");
+
+        // SAFETY: object is ref-counted, as checked above.
+        let success = unsafe { self.as_ref_counted_mut().reference() };
+        assert!(success, "RefCounted::reference() failed");
+    }
+
+    /// Decrements the reference count. Returns `true` if the count hit 0 and the object can be safely freed.
+    ///
+    /// No-op returning `false` if `T` is not ref-counted. A script can override `unreference()`, so `false` is also possible at count 0.
+    ///
+    /// # Safety
+    /// If the object is ref-counted, then the reference count must either be incremented before it hits 0, or some [`Gd`] referencing
+    /// this object must be forgotten.
+    unsafe fn refc_dec(&mut self) -> bool {
+        if !self.is_ref_counted() {
+            return false;
+        }
+
+        out!("  RawGd::refc_dec:  {self:?}");
+
+        // SAFETY: object is ref-counted, as checked above.
+        let is_last = unsafe { self.as_ref_counted_mut().unreference() };
+        out!("  +-- was last={is_last}");
+        is_last
+    }
+
+    /// Enables outer `Gd` APIs or bypasses additional null checks, in cases where `RawGd` is guaranteed non-null.
+    ///
+    /// # Safety
+    /// `self` must not be null.
+    pub(crate) unsafe fn as_non_null(&self) -> &Gd<T> {
+        sys::strict_assert!(
+            !self.is_null(),
+            "RawGd::as_non_null() called on null pointer; this is UB"
+        );
+
+        // SAFETY: layout of Gd<T> is currently equivalent to RawGd<T>.
+        unsafe { std::mem::transmute::<&RawGd<T>, &Gd<T>>(self) }
+    }
+
+    pub(crate) fn as_object_ref(&self) -> &classes::Object {
+        // SAFETY: Object is always a valid upcast target.
+        unsafe { self.as_upcast_ref() }
+    }
+
+    pub(crate) fn as_object_mut(&mut self) -> &mut classes::Object {
+        // SAFETY: Object is always a valid upcast target.
+        unsafe { self.as_upcast_mut() }
+    }
+
+    /// # Panics
+    /// If this `RawGd` is null. In Debug mode, sanity checks (valid upcast, ID comparisons) can also lead to panics.
+    ///
+    /// # Safety
+    /// - `Base` must actually be a base class of `T`.
+    /// - `Base` must be an engine class.
+    ///
+    /// This is not done via bounds because that would infect all APIs with `Inherits<T>` and leads to cycles in `Deref`.
+    /// Bounds should be added on user-facing safe APIs.
+    pub(super) unsafe fn as_upcast_ref<Base>(&self) -> &Base
+    where
+        // DeclEngine needed for sound transmute; in case we add Rust-defined base classes.
+        Base: GodotClass + Bounds<Declarer = bounds::DeclEngine>,
+    {
+        self.check_rtti("upcast_ref");
+
+        // SAFETY:
+        // Every engine object is a struct like:
+        //
+        // #[repr(C)]
+        // struct Node3D {
+        //     object_ptr: sys::GDExtensionObjectPtr,
+        //     rtti: Option<ObjectRtti>,
+        // }
+        //
+        // and `RawGd` looks like:
+        //
+        // #[repr(C)]
+        // pub struct RawGd<T: GodotClass> {
+        //     obj: *mut T,
+        //     cached_rtti: Option<ObjectRtti>,
+        //     cached_storage_ptr: InstanceCache, // ZST for engine classes.
+        // }
+        //
+        // The pointers have the same meaning despite different types, and so the whole struct is layout-compatible.
+        // In addition, Gd<T> as opposed to RawGd<T> will have the Option always set to Some.
+        unsafe { std::mem::transmute::<&Self, &Base>(self) }
+    }
+
+    /// # Panics
+    /// If this `RawGd` is null. In Debug mode, sanity checks (valid upcast, ID comparisons) can also lead to panics.
+    ///
+    /// # Safety
+    /// - `Base` must actually be a base class of `T`.
+    /// - `Base` must be an engine class.
+    ///
+    /// This is not done via bounds because that would infect all APIs with `Inherits<T>` and leads to cycles in `Deref`.
+    /// Bounds should be added on user-facing safe APIs.
+    pub(super) unsafe fn as_upcast_mut<Base>(&mut self) -> &mut Base
+    where
+        // DeclEngine needed for sound transmute; in case we add Rust-defined base classes.
+        Base: GodotClass + Bounds<Declarer = bounds::DeclEngine>,
+    {
+        unsafe {
+            self.check_rtti("upcast_ref");
+
+            // SAFETY: see also `as_upcast_ref()`.
+            //
+            // We have a mutable reference to self, and thus it's safe to transmute that into a
+            // mutable reference to a compatible type.
+            //
+            // There cannot be aliasing on the same internal Base object, as every Gd<T> has a different such object -- aliasing
+            // of the internal object would thus require multiple &mut Gd<T>, which cannot happen.
+            std::mem::transmute::<&mut Self, &mut Base>(self)
+        }
+    }
+
+    /// # Panics
+    /// If this `RawGd` is null.
+    pub(super) fn as_target(&self) -> &GdDerefTarget<T>
+    where
+        GdDerefTarget<T>: Bounds<Declarer = bounds::DeclEngine>,
+    {
+        // SAFETY: There are two possible Declarer::DerefTarget types:
+        // - T, if T is an engine class
+        // - T::Base, if T is a user class
+        // Both are valid targets for upcast. And both are always engine types.
+        unsafe { self.as_upcast_ref::<GdDerefTarget<T>>() }
+    }
+
+    /// # Panics
+    /// If this `RawGd` is null.
+    pub(super) fn as_target_mut(&mut self) -> &mut GdDerefTarget<T>
+    where
+        GdDerefTarget<T>: Bounds<Declarer = bounds::DeclEngine>,
+    {
+        // SAFETY: See as_target().
+        unsafe { self.as_upcast_mut::<GdDerefTarget<T>>() }
+    }
+
+    /// Validates object for use in `RawGd`/`Gd` methods (not FFI boundary calls).
+    ///
+    /// This is used for Rust-side object operations like `bind()`, `clone()`, `ffi_cast()`, etc.
+    /// For FFI boundary calls (generated engine methods), validation happens in signature.rs instead.
+    ///
+    /// # Panics
+    /// If validation fails.
+    #[cfg(safeguards_balanced)]
+    pub(crate) fn check_rtti(&self, method_name: &'static str) {
+        let call_ctx = CallContext::gd::<T>(method_name);
+
+        // Type check (strict only).
+        #[cfg(safeguards_strict)]
+        self.check_dynamic_type(&call_ctx);
+
+        // SAFETY: check_rtti() is only called for non-null pointers.
+        let instance_id = unsafe { self.instance_id_unchecked().unwrap_unchecked() };
+
+        // Liveness check (balanced + strict).
+        classes::ensure_object_alive(instance_id, self.obj_sys(), &call_ctx);
+    }
+
+    #[cfg(not(safeguards_balanced))]
+    pub(crate) fn check_rtti(&self, _method_name: &'static str) {
+        // Disengaged level: no-op.
+    }
+
+    /// Checks only type, not liveness.
+    ///
+    /// Used in specific scenarios like `Gd<T>::free()` where we need type validation
+    /// but the object may already be dead. This is an internal helper for `check_rtti()`.
+    #[cfg(safeguards_strict)]
+    #[inline]
+    pub(crate) fn check_dynamic_type(&self, call_ctx: &CallContext<'static>) {
+        assert!(
+            !self.is_null(),
+            "internal bug: {call_ctx}: cannot call method on null object",
+        );
+
+        let rtti = self.cached_rtti.as_ref();
+
+        // SAFETY: RawGd non-null (checked above).
+        let rtti = unsafe { rtti.unwrap_unchecked() };
+        rtti.check_type::<T>();
+    }
+
+    /// Creates a validated object for FFI boundary crossing.
+    ///
+    /// This is a convenience wrapper around [`ValidatedObject::validate()`].
+    #[doc(hidden)]
+    #[inline]
+    pub fn validated_object(&self) -> ValidatedObject {
+        ValidatedObject::validate(self)
+    }
+
+    // Not pub(super) because used by godot::meta::args::ObjectArg.
+    pub(crate) fn obj_sys(&self) -> sys::GDExtensionObjectPtr {
+        self.obj as sys::GDExtensionObjectPtr
+    }
+
+    pub(super) fn script_sys(&self) -> sys::GDExtensionScriptLanguagePtr
+    where
+        T: super::Inherits<crate::classes::ScriptLanguage>,
+    {
+        self.obj.cast()
+    }
+}
+
+impl<T> RawGd<T>
+where
+    T: GodotClass + Bounds<Memory = bounds::MemRefCounted>,
+{
+    /// Returns the reference count.
+    ///
+    /// Needs no runtime check, unlike the other ref-count operations: `T` is statically ref-counted, and `Gd` upholds non-nullness.
+    pub(crate) fn ref_count(&self) -> usize {
+        sys::strict_assert!(
+            !self.is_null(),
+            "RawGd::ref_count() called on null pointer; this is UB"
+        );
+
+        // SAFETY: Memory=MemRefCounted statically guarantees T inherits RefCounted.
+        let ref_count = unsafe { self.as_ref_counted().get_reference_count() };
+
+        // TODO find a safer cast alternative, e.g. num-traits crate with ToPrimitive (Debug) + AsPrimitive (Release).
+        ref_count as usize
+    }
+}
+
+impl<T> RawGd<T>
+where
+    T: GodotClass + Bounds<Declarer = bounds::DeclUser>,
+{
+    /// Hands out a guard for a shared borrow, through which the user instance can be read.
+    ///
+    /// See [`Gd::bind()`] for a more in depth explanation.
+    // Note: possible names: write/read, hold/hold_mut, r/w, r/rw, ...
+    pub(crate) fn bind(&self) -> GdRef<'_, T> {
+        self.check_rtti("bind");
+        let storage = self
+            .storage()
+            .unwrap_or_else(|| classes::panic_placeholder_bind::<T>("bind"));
+        GdRef::from_guard(storage.get())
+    }
+
+    /// Hands out a guard for an exclusive borrow, through which the user instance can be read and written.
+    ///
+    /// See [`Gd::bind_mut()`] for a more in depth explanation.
+    pub(crate) fn bind_mut(&mut self) -> GdMut<'_, T> {
+        self.check_rtti("bind_mut");
+        let storage = self
+            .storage()
+            .unwrap_or_else(|| classes::panic_placeholder_bind::<T>("bind_mut"));
+        GdMut::from_guard(storage.get_mut())
+    }
+
+    /// Storage object associated with the extension instance.
+    ///
+    /// Returns `None` if self is null.
+    pub(crate) fn storage(&self) -> Option<&InstanceStorage<T>> {
+        // SAFETY:
+        // - We have a `&self`, so the storage must already have been created.
+        // - The storage cannot be destroyed while we have a `&self` reference, so it will not be
+        //   destroyed for the duration of `'a`.
+        unsafe { self.storage_unbounded() }
+    }
+
+    /// Storage object associated with the extension instance.
+    ///
+    /// Returns `None` if self is null.
+    ///
+    /// # Safety
+    ///
+    /// This method provides a reference to the storage with an arbitrarily long lifetime `'b`. The reference
+    /// must actually be live for the duration of this lifetime.
+    ///
+    /// The only time when a `&mut` reference can be taken to a `InstanceStorage` is when it is constructed
+    /// or destroyed. So it is sufficient to ensure that the storage is not created or destroyed during the
+    /// lifetime `'b`.
+    pub(crate) unsafe fn storage_unbounded<'b>(&self) -> Option<&'b InstanceStorage<T>> {
+        // SAFETY: instance pointer belongs to this instance. We only get a shared reference, no exclusive access, so even
+        // calling this from multiple Gd pointers is safe.
+        //
+        // The caller is responsible for ensuring that the storage is live for the duration of the lifetime
+        // `'b`.
+        //
+        // Potential issue is a concurrent free() in multi-threaded access; but that would need to be guarded against inside free().
+        unsafe {
+            let binding = self.resolve_instance_ptr();
+            sys::ptr_then(binding, |binding| {
+                crate::private::as_weak_storage::<T>(binding)
+            })
+        }
+    }
+
+    /// Retrieves and caches pointer to this class instance if `self.obj` is non-null.
+    /// Returns a null pointer otherwise.
+    ///
+    /// Note: The returned pointer to the GDExtensionClass instance (even when `self.obj` is non-null)
+    /// might still be null when:
+    /// - The class isn't instantiable in the current context.
+    /// - The instance is a placeholder (e.g., non-`tool` classes in the editor). Since Godot 4.3, non-tool classes
+    ///   are registered with `is_runtime = true`, meaning the editor creates only a Godot-side object without
+    ///   calling the Rust constructor. This commonly surfaces when calling `bind()` on a non-tool resource loaded
+    ///   in the editor -- the Godot object exists but has no Rust storage.
+    ///
+    /// However, null pointers might also occur in other, undocumented contexts.
+    ///
+    /// # Panics
+    /// In Debug mode, if binding is null.
+    fn resolve_instance_ptr(&self) -> sys::GDExtensionClassInstancePtr {
+        if self.is_null() {
+            return ptr::null_mut();
+        }
+
+        let cached = self.cached_storage_ptr.get();
+        if !cached.is_null() {
+            return cached;
+        }
+
+        let callbacks = crate::storage::nop_instance_callbacks();
+
+        // SAFETY: library is already initialized.
+        let token = unsafe { sys::get_library() };
+        let token = token.cast::<std::ffi::c_void>();
+
+        // SAFETY: ensured that `self.obj` is non-null and valid.
+        let binding = unsafe {
+            interface_fn!(object_get_instance_binding)(self.obj_sys(), token, &callbacks)
+        };
+
+        let ptr: sys::GDExtensionClassInstancePtr = binding.cast();
+
+        #[cfg(safeguards_strict)]
+        crate::classes::ensure_binding_not_null::<T>(ptr);
+
+        self.cached_storage_ptr.set(ptr);
+        ptr
+    }
+}
+
+// SAFETY:
+// - `move_return_ptr`
+//   When the `call_type` is `PtrcallType::Virtual`, and the current type is known to inherit from `RefCounted`
+//   then we use `ref_get_object`. Otherwise we use `Gd::from_obj_sys`.
+// - `from_arg_ptr`
+//   When the `call_type` is `PtrcallType::Virtual`, and the current type is known to inherit from `RefCounted`
+//   then we use `ref_set_object`. Otherwise we use `std::ptr::write`. Finally we forget `self` as we pass
+//   ownership to the caller.
+unsafe impl<T> GodotFfi for RawGd<T>
+where
+    T: GodotClass,
+{
+    // If anything changes here, keep in sync with ObjectArg impl.
+
+    const VARIANT_TYPE: ExtVariantType = ExtVariantType::Concrete(sys::VariantType::OBJECT);
+
+    #[allow(unsafe_op_in_unsafe_fn)] // Safety preconditions forwarded 1:1.
+    unsafe fn new_from_sys(ptr: sys::GDExtensionConstTypePtr) -> Self {
+        Self::from_obj_sys_weak(ptr as sys::GDExtensionObjectPtr)
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)] // Safety preconditions forwarded 1:1.
+    unsafe fn new_with_uninit(init: impl FnOnce(sys::GDExtensionUninitializedTypePtr)) -> Self {
+        let obj = raw_object_init(init);
+        Self::from_obj_sys_weak(obj)
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)] // Safety preconditions forwarded 1:1.
+    unsafe fn new_with_init(init: impl FnOnce(sys::GDExtensionTypePtr)) -> Self {
+        // `new_with_uninit` creates an initialized pointer.
+        Self::new_with_uninit(|return_ptr| init(sys::SysPtr::force_init(return_ptr)))
+    }
+
+    fn sys(&self) -> sys::GDExtensionConstTypePtr {
+        self.obj.cast()
+    }
+
+    fn sys_mut(&mut self) -> sys::GDExtensionTypePtr {
+        self.obj.cast()
+    }
+
+    // For more context around `ref_get_object` and `ref_set_object`, see:
+    // https://github.com/godotengine/godot-cpp/issues/954
+
+    fn as_arg_ptr(&self) -> sys::GDExtensionConstTypePtr {
+        // Even though ObjectArg exists, this function is still relevant, e.g. in Callable.
+
+        object_as_arg_ptr(&self.obj)
+    }
+
+    unsafe fn from_arg_ptr(ptr: sys::GDExtensionTypePtr, call_type: PtrcallType) -> Self {
+        if ptr.is_null() {
+            return Self::null();
+        }
+
+        let obj_ptr = if T::DynMemory::pass_as_ref(call_type) {
+            // ptr is `Ref<T>*`.
+            // See the docs for `PtrcallType::Virtual` for more info on `Ref<T>`.
+            unsafe { interface_fn!(ref_get_object)(ptr as sys::GDExtensionRefPtr) }
+        } else {
+            // SAFETY: TypePtr == ObjectPtr* == T** (from Godot 4.1 onwards, also in virtual functions.)
+            unsafe { *(ptr as *mut sys::GDExtensionObjectPtr) }
+        };
+
+        // SAFETY: obj_ptr is `T*`.
+        unsafe { Self::from_obj_sys(obj_ptr) }
+    }
+
+    unsafe fn move_return_ptr(self, ptr: sys::GDExtensionTypePtr, call_type: PtrcallType) {
+        if T::DynMemory::pass_as_ref(call_type) {
+            // ref_set_object creates a new Ref<T> in the engine and increments the reference count. We have to drop our Gd<T> to decrement
+            // the reference count again.
+            unsafe { interface_fn!(ref_set_object)(ptr as sys::GDExtensionRefPtr, self.obj_sys()) };
+        } else {
+            unsafe { ptr::write(ptr as *mut *mut T, self.obj) };
+            // We've passed ownership to caller.
+            std::mem::forget(self);
+        }
+    }
+
+    fn adjust_refcount_on_ptrcall_return(&mut self) {
+        // Static type not ref-counted -> is Object, Node etc -> possibly needs incrementing refcount.
+        // refc_inc() is a no-op for Node etc.
+        if !<T::Memory as Memory>::IS_REF_COUNTED {
+            self.refc_inc();
+        }
+    }
+}
+
+impl<T: GodotClass> GodotConvert for RawGd<T> {
+    type Via = Self;
+
+    fn godot_shape() -> GodotShape {
+        Gd::<T>::godot_shape()
+    }
+}
+
+impl<T: GodotClass> ToGodot for RawGd<T> {
+    type Pass = meta::ByRef;
+
+    fn to_godot(&self) -> &Self::Via {
+        self
+    }
+}
+
+impl<T: GodotClass> FromGodot for RawGd<T> {
+    fn try_from_godot(via: Self::Via) -> Result<Self, ConvertError> {
+        Ok(via)
+    }
+}
+
+impl<T: GodotClass> GodotType for RawGd<T> {
+    type Ffi = Self;
+
+    type ToFfi<'f>
+        = RefArg<'f, RawGd<T>>
+    where
+        Self: 'f;
+
+    fn to_ffi(&self) -> Self::ToFfi<'_> {
+        RefArg::new(self)
+    }
+
+    fn into_ffi(self) -> Self::Ffi {
+        self
+    }
+
+    fn try_from_ffi(ffi: Self::Ffi) -> Result<Self, ConvertError> {
+        Ok(ffi)
+    }
+}
+
+impl<T: GodotClass> GodotFfiVariant for RawGd<T> {
+    fn ffi_to_variant(&self) -> Variant {
+        object_ffi_to_variant(self)
+    }
+
+    fn ffi_from_variant(variant: &Variant) -> Result<Self, ConvertError> {
+        let variant_type = variant.get_type();
+
+        // Explicit type check before calling `object_from_variant`, to allow for better error messages.
+        if variant_type != VariantType::OBJECT {
+            return Err(FromVariantError::BadType {
+                expected: VariantType::OBJECT,
+                actual: variant_type,
+            }
+            .into_error(variant.clone()));
+        }
+
+        // Check for dead objects *before* converting. Godot doesn't care if the objects are still alive, and hitting
+        // RawGd::from_obj_sys_weak() is too late and causes UB.
+        if !variant.is_object_alive() {
+            return Err(FromVariantError::DeadObject.into_error(variant.clone()));
+        }
+
+        let raw = unsafe {
+            // Uses RawGd<Object> and not Self, because Godot still allows illegal conversions. We thus check with manual casting later on.
+            // See https://github.com/godot-rust/gdext/issues/158.
+
+            RawGd::<classes::Object>::new_with_uninit(|self_ptr| {
+                let converter = sys::builtin_fn!(object_from_variant);
+                converter(self_ptr, sys::SysPtr::force_mut(variant.var_sys()));
+            })
+        };
+
+        raw.with_inc_refcount().owned_cast().map_err(|raw| {
+            FromVariantError::WrongClass {
+                expected: T::class_id(),
+            }
+            .into_error(raw)
+        })
+    }
+}
+
+/// Destructor with semantics depending on memory strategy.
+///
+/// * If this `RawGd` smart pointer holds a reference-counted type, this will decrement the reference counter.
+///   If this was the last remaining reference, dropping it will invoke `T`'s destructor.
+///
+/// * If the held object is manually-managed, **nothing happens**.
+///   To destroy manually-managed `RawGd` pointers, you need to call [`crate::obj::Gd::free()`].
+impl<T: GodotClass> Drop for RawGd<T> {
+    fn drop(&mut self) {
+        // No-op for manually managed objects
+
+        out!("RawGd::drop:      {self:?}");
+
+        // SAFETY: This `Gd` won't be dropped again after this.
+        // If destruction is triggered by Godot, Storage already knows about it, no need to notify it
+        let is_last = unsafe { self.refc_dec() }; // may drop
+        if is_last {
+            unsafe {
+                interface_fn!(object_destroy)(self.obj_sys());
+            }
+        }
+    }
+}
+
+impl<T: GodotClass> Clone for RawGd<T> {
+    fn clone(&self) -> Self {
+        out!("RawGd::clone:     {self:?}  (before clone)");
+
+        let cloned = if self.is_null() {
+            Self::null()
+        } else {
+            self.check_rtti("clone");
+
+            // Create new object, adopt cached fields.
+            let copy = Self {
+                obj: self.obj,
+                cached_rtti: self.cached_rtti.clone(),
+                cached_storage_ptr: self.cached_storage_ptr.clone(),
+            };
+            copy.with_inc_refcount()
+        };
+
+        out!("                  {self:?}  (after clone)");
+        cloned
+    }
+}
+
+impl<T: GodotClass> fmt::Debug for RawGd<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        classes::debug_string_nullable(self, f, "RawGd")
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Type-state for already-validated objects before an engine API call
+
+/// Type-state object pointers that have been validated for engine API calls.
+///
+/// Can be passed to [`Signature`](meta::signature::Signature) methods. Performs the following checks depending on safeguard level:
+/// - `disengaged`: no validation.
+/// - `balanced`: liveness check only.
+/// - `strict`: liveness + type inheritance check.
+#[doc(hidden)]
+pub struct ValidatedObject {
+    object_ptr: sys::GDExtensionObjectPtr,
+}
+
+impl ValidatedObject {
+    /// Validates a `RawGd<T>` according to the type's invariants (depending on safeguard level).
+    ///
+    /// # Panics
+    /// If validation fails.
+    #[doc(hidden)]
+    #[inline]
+    pub fn validate<T: GodotClass>(raw_gd: &RawGd<T>) -> Self {
+        raw_gd.check_rtti("validated_object");
+
+        Self {
+            object_ptr: raw_gd.obj_sys(),
+        }
+    }
+
+    /// For ref-counted objects, liveness check is not needed; strong ref (RawGd) keeps Godot instance alive.
+    #[doc(hidden)]
+    #[inline]
+    pub fn unvalidated(object_ptr: sys::GDExtensionObjectPtr) -> Self {
+        Self { object_ptr }
+    }
+
+    /// Extracts the object pointer from an `Option<ValidatedObject>`.
+    ///
+    /// Returns null pointer for `None` (static methods), or the validated pointer for `Some`.
+    #[inline]
+    pub fn object_ptr(opt: Option<&Self>) -> sys::GDExtensionObjectPtr {
+        opt.map(|v| v.object_ptr).unwrap_or(ptr::null_mut())
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Reusable functions, also shared with Gd, Variant, ObjectArg.
+
+/// Runs `init_fn` on the address of a pointer (initialized to null), then returns that pointer, possibly still null.
+///
+/// This relies on the fact that an object pointer takes up the same space as the FFI representation of an object (`OpaqueObject`).
+/// The pointer is thus used as an opaque handle, initialized by `init_fn`, so that it represents a valid Godot object afterwards.
+///
+/// # Safety
+/// `init_fn` must be a function that correctly handles a _type pointer_ pointing to an _object pointer_.
+#[doc(hidden)]
+pub unsafe fn raw_object_init(
+    init_fn: impl FnOnce(sys::GDExtensionUninitializedTypePtr),
+) -> sys::GDExtensionObjectPtr {
+    // return_ptr has type GDExtensionTypePtr = GDExtensionObjectPtr* = OpaqueObject* = Object**
+    // (in other words, the type-ptr contains the _address_ of an object-ptr).
+    let mut object_ptr: sys::GDExtensionObjectPtr = ptr::null_mut();
+    let return_ptr: *mut sys::GDExtensionObjectPtr = ptr::addr_of_mut!(object_ptr);
+
+    init_fn(return_ptr as sys::GDExtensionUninitializedTypePtr);
+
+    // We don't need to know if Object** is null, but if Object* is null; return_ptr has the address of a local (never null).
+    object_ptr
+}
+
+// Used by godot::meta::args::ObjectArg + local impl GodotFfiVariant.
+pub(crate) fn object_ffi_to_variant<T: GodotFfi>(self_: &T) -> Variant {
+    // The conversion method `object_to_variant` DOES increment the reference-count of the object; so nothing to do here.
+    // (This behaves differently in the opposite direction `variant_to_object`.)
+
+    unsafe {
+        Variant::new_with_var_uninit(|variant_ptr| {
+            let converter = sys::builtin_fn!(object_to_variant);
+
+            // Note: this is a special case because of an inconsistency in Godot, where sometimes the equivalency is
+            // GDExtensionTypePtr == Object** and sometimes GDExtensionTypePtr == Object*. Here, it is the former, thus extra pointer.
+            // Reported at https://github.com/godotengine/godot/issues/61967
+            let type_ptr = self_.sys();
+            converter(
+                variant_ptr,
+                ptr::addr_of!(type_ptr) as sys::GDExtensionTypePtr,
+            );
+        })
+    }
+}
+
+// Used by godot::meta::args::ObjectArg.
+pub(crate) fn object_as_arg_ptr<F>(_object_ptr_field: &*mut F) -> sys::GDExtensionConstTypePtr {
+    // Be careful when refactoring this code. Address of field pointer matters, copying it into a local variable will create use-after-free.
+
+    // No need to call self.check_rtti("as_arg_ptr") here, since this is already done in ToGodot impl.
+
+    // We pass an object to a Godot API. If the reference count needs to be incremented, then the callee (Godot C++ function) will do so.
+    // We do not need to prematurely do so. In Rust terms, if `T` is ref-counted, then we are effectively passing a `&Arc<T>`, and the
+    // callee would need to invoke `.clone()` if desired.
+
+    // Since 4.1, argument pointers were standardized to always be `T**`.
+    ptr::addr_of!(*_object_ptr_field) as sys::GDExtensionConstTypePtr
+}

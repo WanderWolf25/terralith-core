@@ -1,0 +1,142 @@
+/*
+ * Copyright (c) godot-rust; Bromeon and contributors.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+//! Testing that GDScript and Rust produces the same property info for properties exported to Godot.
+
+// We're using some weird formatting just for simplicity's sake.
+#![allow(non_snake_case)]
+
+use std::collections::HashMap;
+
+use godot::prelude::*;
+use godot::register::info::PropertyUsageFlags;
+use godot::sys::GdextBuild;
+
+use crate::framework::{TestContext, itest};
+use crate::register_tests::gen_ffi::PropertyTestsRust;
+
+#[itest]
+fn property_template_test(ctx: &TestContext) {
+    let rust_properties = PropertyTestsRust::new_alloc();
+    let gdscript_properties = ctx.property_tests.clone();
+
+    // Detect stale GenPropertyTests.gd left over from a build against a different godot-rust API version.
+    let built_for = gdscript_properties.get("built_for_api_minor").to::<u32>();
+    let (_, api_minor, _) = GdextBuild::godot_static_version_triple();
+    assert_eq!(
+        built_for, api_minor as u32,
+        "GenPropertyTests.gd is stale (built for API 4.{built_for}, current API is 4.{api_minor}).\n\
+         Regenerate: touch itest/rust/build.rs && cargo build -p itest --no-default-features"
+    );
+
+    // Accumulate errors so we can catch all of them in one go.
+    let mut errors: Vec<String> = Vec::new();
+    let mut properties: HashMap<String, VarDictionary> = HashMap::new();
+
+    for property in rust_properties.get_property_list().iter_shared() {
+        let name = property.get("name").unwrap().to::<String>();
+
+        // Skip @export_file and similar properties for Array<GString> and PackedStringArray (only supported in Godot 4.3+).
+        // Here, we use API and not runtime level, because inclusion/exclusion of GDScript code is determined at build time in godot-bindings.
+        // Anecdote: the format of array properties changed in Godot 4.2.
+        //
+        // Name can start in `export_file`, `export_global_file`, `export_dir`, `export_global_dir`.
+        // Can end in either `_array` or `_parray`.
+        #[cfg(before_api = "4.3")]
+        if (name.contains("_file_") || name.contains("_dir_")) && name.ends_with("array") {
+            continue;
+        }
+
+        if name.starts_with("var_") || name.starts_with("export_") {
+            properties.insert(name, property);
+        }
+    }
+
+    // User-defined GDScript enums reference their type by script path (e.g. "res://gen/GenPropertyTests.gd.Tile"), which cannot be reproduced
+    // from Rust. This is a Godot limitation: GDScript enums have script-path-based identity that Rust-side registration can't replicate for
+    // #[var] (ARRAY_TYPE/DICTIONARY_TYPE hints use the type name). The #[export] variants work because they use TYPE_STRING hints with
+    // element type strings (variant_type/hint:hint_string format), which don't require script-path enum names.
+    #[cfg(since_api = "4.4")]
+    {
+        properties.remove("var_array_tile");
+        properties.remove("var_dict_vector2i_tile");
+    }
+
+    // Bitfield properties (e.g. MouseButtonMask) can't be expressed as typed GDScript variables,
+    // so there's no GDScript counterpart to compare against.
+    properties.remove("var_bitfield");
+    properties.remove("export_bitfield");
+
+    assert!(!properties.is_empty());
+
+    for mut gdscript_prop in gdscript_properties.get_property_list().iter_shared() {
+        let name = gdscript_prop.at("name").to::<String>();
+
+        let Some(mut rust_prop) = properties.remove(&name) else {
+            continue;
+        };
+
+        let mut rust_usage = rust_prop.at("usage").to::<PropertyUsageFlags>();
+
+        // The GDSscript variables are script variables, and so have `PROPERTY_USAGE_SCRIPT_VARIABLE` set.
+        // Before 4.3, `PROPERTY_USAGE_SCRIPT_VARIABLE` did the same thing as `PROPERTY_USAGE_STORAGE` and
+        // so GDScript didn't set both if it didn't need to.
+        if GdextBuild::before_api("4.3") {
+            if rust_usage == PropertyUsageFlags::STORAGE {
+                rust_usage = PropertyUsageFlags::SCRIPT_VARIABLE
+            } else {
+                rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE;
+            }
+        } else {
+            rust_usage |= PropertyUsageFlags::SCRIPT_VARIABLE;
+        }
+
+        rust_prop.set("usage", rust_usage);
+
+        // From Godot 4.4, GDScript uses `.0` for integral floats, see https://github.com/godotengine/godot/pull/47502.
+        // We still register them the old way, to test compatibility. See also godot-core/src/registry/property.rs.
+        // Since GDScript now registers them with `.0`, we need to account for that.
+        if GdextBuild::since_api("4.4") {
+            let mut hint_string = gdscript_prop.at("hint_string").to::<String>();
+
+            // Don't check against `.0` to not accidentally catch `.02`. We don't have regex available here.
+            if hint_string.contains(".0,") {
+                hint_string = hint_string.replace(".0,", ",");
+                gdscript_prop.set("hint_string", hint_string.clone());
+            }
+
+            if hint_string.ends_with(".0") {
+                gdscript_prop.set("hint_string", hint_string.trim_end_matches(".0"));
+            }
+        }
+
+        if rust_prop != gdscript_prop {
+            errors.push(format!(
+                "mismatch in property {name}:\n  GDScript: {gdscript_prop:?}\n  Rust:     {rust_prop:?}"
+            ));
+        }
+        /*else { // Keep around for debugging.
+            println!(
+                "good property {name}:\n  GDScript: {gdscript_prop:?}\n  Rust:     {rust_prop:?}"
+            );
+        }*/
+    }
+
+    rust_properties.free();
+
+    assert!(
+        properties.is_empty(),
+        "not all properties were matched, missing: {properties:?}"
+    );
+
+    assert!(
+        errors.is_empty(),
+        "Encountered {} mismatches between GDScript and Rust:\n{}",
+        errors.len(),
+        errors.join("\n")
+    );
+}

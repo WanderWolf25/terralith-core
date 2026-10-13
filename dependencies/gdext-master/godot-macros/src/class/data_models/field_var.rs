@@ -1,0 +1,632 @@
+/*
+ * Copyright (c) godot-rust; Bromeon and contributors.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use proc_macro2::{Ident, Span, TokenStream};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
+use venial::TypeExpr;
+
+use crate::class::{
+    Field, FieldHint, FuncDefinition, into_signature_info, make_accessor_type_check,
+    make_method_registration,
+};
+use crate::util::{KvParser, ident, make_funcs_collection_constant};
+use crate::{ParseResult, util};
+
+/// Store info from `#[var]` attribute.
+#[derive(Clone, Debug)]
+pub struct FieldVar {
+    /// What name this variable should have in Godot, if `None` then the Rust name should be used.
+    pub rename: Option<String>,
+    pub getter: GetterSetter,
+    pub setter: GetterSetter,
+    pub hint: FieldHint,
+    pub usage_flags: UsageFlags,
+    /// Whether generated getters/setters should be exposed in Rust public API (without deprecation warning).
+    pub rust_public: bool,
+    pub span: Span,
+}
+
+impl FieldVar {
+    /// Parse a `#[var]` attribute to a `FieldVar` struct.
+    ///
+    /// Possible keys:
+    /// - `rename = ident`
+    /// - `get`, `get = expr`, `no_get`
+    /// - `set`, `set = expr`, `no_set`
+    /// - `pub`
+    /// - `hint = ident`
+    /// - `hint_string = expr`
+    /// - `usage_flags = [...]`
+    pub(crate) fn new_from_kv(parser: &mut KvParser) -> ParseResult<Self> {
+        let span = parser.span();
+        let rename = parser.handle_ident("rename")?.map(|i| i.to_string());
+        let getter = GetterSetter::parse(parser, "get")?;
+        let setter = GetterSetter::parse(parser, "set")?;
+        let rust_public = parser.handle_alone("pub")?;
+
+        // Validate: `pub` only makes sense if at least one accessor is generated.
+        if rust_public && getter != GetterSetter::Generated && setter != GetterSetter::Generated {
+            return Err(util::error!(
+                span,
+                "`pub` requires at least one generated accessor; both getter and setter are user-defined or disabled"
+            ));
+        }
+
+        let hint = parser.handle_ident("hint")?;
+
+        let hint = if let Some(hint) = hint {
+            let hint_string = parser.handle_expr("hint_string")?;
+
+            FieldHint::new(hint, hint_string)
+        } else {
+            FieldHint::Inferred
+        };
+
+        let usage_flags = match parser.handle_array("usage_flags")? {
+            Some(mut parser) => {
+                let mut flags = Vec::new();
+
+                while let Some(flag) = parser.next_ident()? {
+                    flags.push(flag)
+                }
+
+                parser.finish()?;
+
+                UsageFlags::Custom(flags)
+            }
+            _ => UsageFlags::Inferred,
+        };
+
+        Ok(FieldVar {
+            rename,
+            getter,
+            setter,
+            hint,
+            usage_flags,
+            rust_public,
+            span,
+        })
+    }
+
+    pub(crate) fn new_tool_button_from_kv(
+        parser: &mut KvParser,
+        field_name: &Ident,
+    ) -> ParseResult<Self> {
+        let span = parser.span();
+
+        let hint_string = {
+            // Trim the surrounding quotes of the string literal once at the source, so both branches below use the clean name.
+            let name = if let Some(lit) = parser.handle_literal("name", "String")? {
+                lit.to_string().trim_matches('\"').to_string()
+            } else {
+                field_name.to_string().replace("_", " ")
+            };
+
+            if let Some(icon) = parser.handle_literal("icon", "String")? {
+                let unquoted_icon = icon.to_string();
+                let unquoted_icon = unquoted_icon.trim_matches('\"');
+                format!("{name},{unquoted_icon}")
+            } else {
+                name
+            }
+        };
+
+        let Some(tool_button_fn) = parser.handle_expr("fn")? else {
+            return Err(util::error!(
+                span,
+                "`#[export_tool_button]` requires `fn` attribute.\n  \
+                 Tip: use `#[export_tool_button(fn = ...)]`."
+            ));
+        };
+
+        let hint = FieldHint::new(ident("TOOL_BUTTON"), Some(hint_string.to_token_stream()));
+        Ok(FieldVar {
+            rename: None,
+            getter: GetterSetter::ToolButton(ToolButtonFn(tool_button_fn)),
+            setter: GetterSetter::Disabled,
+            hint,
+            usage_flags: UsageFlags::Custom(vec![ident("EDITOR")]),
+            rust_public: true,
+            span,
+        })
+    }
+}
+
+impl Default for FieldVar {
+    fn default() -> Self {
+        Self {
+            rename: Default::default(),
+            getter: Default::default(),
+            setter: Default::default(),
+            hint: Default::default(),
+            usage_flags: Default::default(),
+            rust_public: false,
+            span: Span::call_site(),
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub(crate) struct ToolButtonFn(TokenStream);
+
+impl Eq for ToolButtonFn {}
+
+impl PartialEq for ToolButtonFn {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_string() == other.0.to_string()
+    }
+}
+
+#[derive(Default, Clone, Eq, PartialEq, Debug)]
+pub enum GetterSetter {
+    /// `#[var]`: Trivial getter/setter should be autogenerated.
+    #[default]
+    Generated,
+
+    /// `#[var(get)]`: Custom setter with default name.
+    Custom,
+
+    /// `#[var(get = ident)]`: Custom setter with custom name.
+    CustomRenamed(Ident),
+
+    /// `#[export_tool_button(fn = expr)]`: Autogenerated getter for Export Tool Button.
+    ToolButton(ToolButtonFn),
+
+    /// `#[var(no_get)]`: Getter/setter is absent, field is write/read only.
+    Disabled,
+}
+
+impl GetterSetter {
+    /// Parse a getter or setter from the attribute parser.
+    ///
+    /// Note: `get`/`set` accept only a single identifier (a method name on `Self`), unlike the `fn` key in `#[export_tool_button]`
+    /// which accepts arbitrary expressions. This is intentional: getter/setter functions must be `&self`/`&mut self` methods
+    /// registered with Godot, not free functions or closures.
+    pub(super) fn parse(parser: &mut KvParser, key: &str) -> ParseResult<Self> {
+        // #[var(no_get)], #[var(no_set)]
+        if parser.handle_alone(&format!("no_{key}"))? {
+            return Ok(GetterSetter::Disabled);
+        }
+
+        let getter_setter = match parser.handle_any(key) {
+            // No `get` key.
+            None => GetterSetter::Generated,
+            Some(value) => match value {
+                // `get` without value: user-defined impl, but default name.
+                None => GetterSetter::Custom,
+                // `get = expr`
+                Some(value) => GetterSetter::CustomRenamed(value.ident()?),
+            },
+        };
+
+        Ok(getter_setter)
+    }
+
+    /// Returns the name, implementation, and export tokens for this `GetterSetter` declaration, for the
+    /// given field and getter/setter kind.
+    ///
+    /// Returns `None` if no getter/setter should be created.
+    pub(super) fn to_impl(
+        &self,
+        class_name: &Ident,
+        kind: GetSet,
+        field: &Field,
+        rename: Option<&str>,
+        rust_public: bool,
+    ) -> Option<GetterSetterImpl> {
+        match self {
+            GetterSetter::Disabled => match kind {
+                // #[var(no_get)] *does* register a getter, but a special one which panics, to improve UX over Godot's default behavior.
+                GetSet::Get => Some(GetterSetterImpl::from_write_only_getter(
+                    class_name, field, rename,
+                )),
+                GetSet::Set => None,
+            },
+            GetterSetter::Generated => Some(GetterSetterImpl::from_generated_impl(
+                class_name,
+                kind,
+                field,
+                rename,
+                rust_public,
+                None,
+            )),
+            GetterSetter::Custom => Some(GetterSetterImpl::from_custom_impl(
+                class_name, kind, field, rename,
+            )),
+            GetterSetter::CustomRenamed(function_name) => Some(
+                GetterSetterImpl::from_custom_impl_renamed(class_name, kind, field, function_name),
+            ),
+            GetterSetter::ToolButton(tool_button_fn) => {
+                Some(GetterSetterImpl::from_generated_impl(
+                    class_name,
+                    kind,
+                    field,
+                    rename,
+                    rust_public,
+                    Some(&tool_button_fn.0),
+                ))
+            }
+        }
+    }
+}
+
+/// Used to determine whether a [`GetterSetter`] is supposed to be a getter or setter.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum GetSet {
+    Get,
+    Set,
+}
+
+impl GetSet {
+    /// Create the Rust name for this getter/setter. Used for `#[var(pub)]` methods.
+    pub fn make_pub_fn_name(self, field_name: &Ident, rename: Option<&str>) -> Ident {
+        let prefix = self.prefix();
+
+        if let Some(rename) = rename {
+            format_ident!("{prefix}{rename}", span = field_name.span())
+        } else {
+            format_ident!("{prefix}{field_name}", span = field_name.span())
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            GetSet::Get => "get_",
+            GetSet::Set => "set_",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GetterSetterImpl {
+    pub rust_accessor: Ident,
+    pub function_impl: TokenStream,
+    pub export_token: TokenStream,
+    pub funcs_collection_constant: TokenStream,
+}
+
+impl GetterSetterImpl {
+    fn from_generated_impl(
+        class_name: &Ident,
+        kind: GetSet,
+        field: &Field,
+        rename: Option<&str>,
+        rust_public: bool,
+        tool_button_fn: Option<&TokenStream>,
+    ) -> Self {
+        let Field {
+            name: field_name,
+            ty: field_type,
+            ..
+        } = field;
+
+        // Use field's span so errors point to the field, not the derive macro. Separate type span for trait errors, e.g.:
+        //
+        //   328 |     pub my_enum: TestEnum,
+        //       |                  ^^^^^^^^ the trait `Clone` is not implemented for `TestEnum`
+        //       |
+        //       = note: required for `TestEnum` to implement `Var` (Clone bound for blanket impl)
+        let field_ty_span = field_type.span();
+        let field_span = field_name.span();
+
+        // Godot-registered function name is always the user-facing name.
+        let godot_function_name = kind.make_pub_fn_name(field_name, rename);
+
+        // For #[var(pub)], use the nice name and Var::PubType (Clone-based semantics for blanket impl).
+        // Otherwise, use a mangled internal name, Var::Via (GodotConvert-based semantics),
+        // and generate a deprecated forwarding function.
+        // TODO(v0.6): remove deprecated forwarding functions.
+        let rust_accessor;
+        let doc_hidden;
+        let deprecated_function;
+        let signature;
+        let function_body;
+
+        if let Some(tool_button_fn) = tool_button_fn {
+            rust_accessor = godot_function_name.clone();
+            doc_hidden = quote! { #[doc(hidden)] };
+            deprecated_function = TokenStream::new();
+
+            (signature, function_body) = GetterSetterImpl::generate_tool_button_impl(
+                field_name,
+                field_type,
+                &rust_accessor,
+                tool_button_fn,
+            );
+        } else {
+            // Godot accessor always uses `GodotConvert::Via` (not `PubType`): it satisfies the `GodotType` bound and is nullable for
+            // `OnEditor<Gd<T>>` so hot-reload reads uninit fields as null rather than panicking. `make_named_accessor()` then adds
+            // an ergonomic `PubType` accessor for `#[var(pub)]`, or a deprecated `Via` forwarder for plain `#[var]`.
+            let prefix = kind.prefix();
+            rust_accessor = format_ident!("__godot_{prefix}{field_name}", span = field_span);
+            doc_hidden = quote! { #[doc(hidden)] };
+
+            deprecated_function = Self::make_named_accessor(
+                kind,
+                rust_public,
+                field,
+                &godot_function_name,
+                &rust_accessor,
+            );
+
+            match kind {
+                GetSet::Get => {
+                    signature = quote_spanned! { field_ty_span=>
+                        fn #rust_accessor(&self) -> <#field_type as ::godot::meta::GodotConvert>::Via
+                    };
+                    function_body = quote_spanned! { field_ty_span=>
+                        <#field_type as ::godot::register::property::Var>::var_get(&self.#field_name)
+                    };
+                }
+                GetSet::Set => {
+                    signature = quote_spanned! { field_ty_span=>
+                        fn #rust_accessor(&mut self, #field_name: <#field_type as ::godot::meta::GodotConvert>::Via)
+                    };
+                    function_body = quote_spanned! { field_ty_span=>
+                        <#field_type as ::godot::register::property::Var>::var_set(&mut self.#field_name, #field_name)
+                    };
+                }
+            }
+        }
+
+        // Assign all tokens to field's span. Supposed to help IDE navigation (get_foo -> foo field), but did not work out in testing.
+        // The function names already have the correct spans, so simple quote! might also work here.
+        let function_impl = quote_spanned! { field_span=>
+            #doc_hidden
+            pub #signature {
+                #function_body
+            }
+            #deprecated_function
+        };
+
+        let (funcs_collection_constant, export_token) =
+            Self::make_registration(class_name, &rust_accessor, &godot_function_name, signature);
+
+        Self {
+            rust_accessor,
+            function_impl,
+            export_token,
+            funcs_collection_constant,
+        }
+    }
+
+    /// Generates a getter that panics with a descriptive message for write-only (`#[var(no_get)]`) fields.
+    fn from_write_only_getter(class_name: &Ident, field: &Field, rename: Option<&str>) -> Self {
+        let Field {
+            name: field_name,
+            ty: field_type,
+            ..
+        } = field;
+
+        let field_span = field_name.span();
+        let prefix = GetSet::Get.prefix();
+        // Use a mangled name so the panicking getter is not accidentally called as `get_field()` in GDScript.
+        let godot_function_name =
+            format_ident!("__disabled_{prefix}{field_name}", span = field_span);
+        let rust_accessor = format_ident!("__godot_{prefix}{field_name}", span = field_span);
+
+        let method_name = match rename {
+            Some(rename) => rename.to_string(),
+            None => field_name.to_string(),
+        };
+        let panic_message =
+            format!("property '{class_name}::{method_name}' is write-only through #[var(no_get)]");
+
+        let signature = quote_spanned! { field_span=>
+            fn #rust_accessor(&self) -> <#field_type as ::godot::meta::GodotConvert>::Via
+        };
+
+        let function_impl = quote_spanned! { field_span=>
+            #[doc(hidden)]
+            pub #signature {
+                panic!(#panic_message)
+            }
+        };
+
+        let (funcs_collection_constant, export_token) =
+            Self::make_registration(class_name, &rust_accessor, &godot_function_name, signature);
+
+        Self {
+            rust_accessor,
+            function_impl,
+            export_token,
+            funcs_collection_constant,
+        }
+    }
+
+    /// Registers a generated accessor with Godot. Shared by `from_generated_impl` and `from_write_only_getter`.
+    ///
+    /// Returns `(funcs_collection_constant, export_token)`.
+    fn make_registration(
+        class_name: &Ident,
+        rust_accessor: &Ident,
+        godot_function_name: &Ident,
+        signature: TokenStream,
+    ) -> (TokenStream, TokenStream) {
+        let funcs_collection_constant = make_funcs_collection_constant(
+            class_name,
+            rust_accessor,
+            Some(&godot_function_name.to_string()),
+            &[],
+        );
+
+        let signature = util::parse_signature(signature);
+        let export_token = make_method_registration(
+            class_name,
+            FuncDefinition {
+                signature_info: into_signature_info(signature, class_name, false),
+                // Since we're analyzing a struct's field, we don't have access to the corresponding get/set function's external (non-#[func])
+                // attributes. We have to assume the function exists and has the name the user gave us, with the expected signature.
+                // Ideally, we'd be able to place #[cfg_attr] on #[var(get)] and #[var(set)] to be able to match a #[cfg()] (for instance)
+                // placed on the getter/setter function, but that is not currently supported.
+                external_attributes: Vec::new(),
+                // The Rust function name may differ from the Godot name (e.g. `__godot_get_field` vs `get_field`).
+                registered_name: Some(godot_function_name.to_string()),
+                is_script_virtual: false,
+                rpc_info: None,
+                is_generated_accessor: true,
+            },
+            None,
+        );
+
+        let export_token = export_token.expect("accessor registration should not fail");
+
+        (funcs_collection_constant, export_token)
+    }
+
+    // Nice-named function emitted alongside the registered (`Via`) accessor. For `#[var(pub)]`, an ergonomic `PubType` accessor;
+    // otherwise a deprecated `Via` forwarder that delegates to the mangled `rust_accessor`.
+    fn make_named_accessor(
+        kind: GetSet,
+        rust_public: bool,
+        field: &Field,
+        godot_function_name: &Ident,
+        rust_accessor: &Ident,
+    ) -> TokenStream {
+        let Field {
+            name: field_name,
+            ty: field_type,
+            ..
+        } = field;
+        let field_ty_span = field_type.span();
+
+        if rust_public {
+            let pub_fn = match kind {
+                GetSet::Get => quote_spanned! { field_ty_span=>
+                    pub fn #godot_function_name(&self) -> <#field_type as ::godot::register::property::Var>::PubType {
+                        <#field_type as ::godot::register::property::Var>::var_pub_get(&self.#field_name)
+                    }
+                },
+                GetSet::Set => quote_spanned! { field_ty_span=>
+                    pub fn #godot_function_name(&mut self, #field_name: <#field_type as ::godot::register::property::Var>::PubType) {
+                        <#field_type as ::godot::register::property::Var>::var_pub_set(&mut self.#field_name, #field_name)
+                    }
+                },
+            };
+
+            quote! {
+                #[allow(dead_code)] // Public accessor may be unused within the defining crate (e.g. cdylib with no Rust callers).
+                #pub_fn
+            }
+        } else {
+            // Uses GodotConvert::Via as opposed to Var::PubType, because the latter has no ToGodot/FromGodot bound, while Via always
+            // has GodotType (and thus EngineToGodot). This is needed for the Signature machinery in method registration.
+            let deprecated_fn = match kind {
+                GetSet::Get => quote_spanned! { field_ty_span=>
+                    pub fn #godot_function_name(&self) -> <#field_type as ::godot::meta::GodotConvert>::Via {
+                        self.#rust_accessor()
+                    }
+                },
+                GetSet::Set => quote_spanned! { field_ty_span=>
+                    pub fn #godot_function_name(&mut self, #field_name: <#field_type as ::godot::meta::GodotConvert>::Via) {
+                        self.#rust_accessor(#field_name)
+                    }
+                },
+            };
+
+            quote! {
+                #[deprecated = "Auto-generated Rust getters/setters for `#[var]` are being phased out until v0.6.\n\
+                    If you need them, opt in with #[var(pub)]."]
+                #[allow(dead_code)] // These functions are not used for registration; pub fns in private modules remain unused.
+                #deprecated_fn
+            }
+        }
+    }
+
+    fn generate_tool_button_impl(
+        field_name: &Ident,
+        field_type: &TypeExpr,
+        rust_accessor: &Ident,
+        tool_button_fn: &TokenStream,
+    ) -> (TokenStream, TokenStream) {
+        let field_ty_span = field_type.span();
+        let callable_name = format!("tool_button_{field_name}");
+
+        let signature = quote_spanned! { field_ty_span=>
+            fn #rust_accessor(&self) -> <#field_type as ::godot::register::property::Var>::PubType
+        };
+
+        // Capture `InstanceId` (quasi weak-ref) rather than `Gd<Self>` (strong-ref).
+        //
+        // Godot's `ClassDB::class_get_property_default_value` default-constructs a temporary instance, calls this getter and then frees
+        // the instance via `memdelete()` -- which bypasses `RefCounted::unreference()`. For Self inheriting RefCounted, a `Gd<Self>` pointer
+        // captured in the Callable closure would therefore point to a destroyed object. This violates invariants for a ref-counted Gd pointer,
+        // which embodies an always-valid strong-ref.
+        //
+        // So when the callable is invoked next time, use-after-free (disengaged) or a last-defense panic (balanced/strict) is triggered.
+        // So instead, we dereference through the InstanceId, which is safe. This falls back to a `godot_error!` if the instance is gone.
+        let function_body = quote_spanned! { field_ty_span=>
+            let instance_id = ::godot::obj::WithBaseField::base(self).instance_id();
+            #[allow(clippy::redundant_closure_call, clippy::explicit_auto_deref)]
+            Callable::from_fn(#callable_name, move |_args| {
+                match ::godot::obj::Gd::<Self>::try_from_instance_id(instance_id) {
+                    Ok(mut obj) => (#tool_button_fn)(&mut *obj.bind_mut()),
+                    Err(_) => ::godot::global::godot_error!(
+                        "tool button `{}` invoked on freed instance {:?}",
+                        #callable_name, instance_id,
+                    ),
+                }
+            })
+        };
+
+        (signature, function_body)
+    }
+
+    /// User-defined name.
+    fn from_custom_impl_renamed(
+        class_name: &Ident,
+        kind: GetSet,
+        field: &Field,
+        function_name: &Ident,
+    ) -> Self {
+        let export_token = make_accessor_type_check(class_name, function_name, &field.ty, kind);
+
+        Self {
+            rust_accessor: function_name.clone(),
+            function_impl: TokenStream::new(),
+            export_token,
+            funcs_collection_constant: TokenStream::new(),
+        }
+    }
+
+    /// Default name for property.
+    fn from_custom_impl(
+        class_name: &Ident,
+        kind: GetSet,
+        field: &Field,
+        rename: Option<&str>,
+    ) -> Self {
+        let function_name = kind.make_pub_fn_name(&field.name, rename);
+        let export_token = make_accessor_type_check(class_name, &function_name, &field.ty, kind);
+
+        Self {
+            rust_accessor: function_name,
+            function_impl: TokenStream::new(),
+            export_token,
+            funcs_collection_constant: TokenStream::new(),
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub enum UsageFlags {
+    /// The usage flags should be inferred based on context.
+    #[default]
+    Inferred,
+
+    /// The usage flags should be inferred based on context, such that they include export.
+    InferredExport,
+
+    /// Use a custom set of usage flags provided by the user.
+    Custom(Vec<Ident>),
+}
+
+impl UsageFlags {
+    pub fn is_inferred(&self) -> bool {
+        matches!(self, Self::Inferred)
+    }
+}

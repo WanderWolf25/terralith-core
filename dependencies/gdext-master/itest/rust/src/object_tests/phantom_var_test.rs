@@ -1,0 +1,140 @@
+/*
+ * Copyright (c) godot-rust; Bromeon and contributors.
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+use godot::builtin::{Callable, GString};
+use godot::classes::RefCounted;
+use godot::obj::Base;
+use godot::register::property::PhantomVar;
+use godot::register::{GodotClass, godot_api};
+
+use crate::framework::{itest, suppress_godot_print};
+
+#[derive(GodotClass)]
+#[class(init)]
+struct HasPhantomVar {
+    #[var(get = get_read_only, no_set)]
+    read_only: PhantomVar<i64>,
+
+    #[var(get, set)]
+    read_write: PhantomVar<i64>,
+
+    #[var(get = get_engine_enum, set = set_engine_enum)]
+    read_write_engine_enum: PhantomVar<godot::global::VerticalAlignment>,
+
+    #[var(get = get_bit_enum, set = set_bit_enum)]
+    read_write_bit_enum: PhantomVar<godot::global::KeyModifierMask>,
+
+    value: i64,
+
+    #[init(val = godot::global::VerticalAlignment::CENTER)]
+    engine_enum_value: godot::global::VerticalAlignment,
+
+    #[init(val = godot::global::KeyModifierMask::ALT|godot::global::KeyModifierMask::CTRL)]
+    bit_enum_value: godot::global::KeyModifierMask,
+}
+
+#[godot_api]
+impl HasPhantomVar {
+    #[func]
+    fn get_read_only(&self) -> i64 {
+        self.value
+    }
+
+    #[func]
+    fn get_read_write(&self) -> i64 {
+        self.value
+    }
+
+    #[func]
+    fn set_read_write(&mut self, value: i64) {
+        self.value = value;
+    }
+
+    #[func]
+    fn get_engine_enum(&self) -> godot::global::VerticalAlignment {
+        self.engine_enum_value
+    }
+
+    #[func]
+    fn set_engine_enum(&mut self, value: godot::global::VerticalAlignment) {
+        self.engine_enum_value = value;
+    }
+
+    #[func]
+    fn get_bit_enum(&self) -> godot::global::KeyModifierMask {
+        self.bit_enum_value
+    }
+
+    #[func]
+    fn set_bit_enum(&mut self, value: godot::global::KeyModifierMask) {
+        self.bit_enum_value = value;
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+
+#[cfg(since_api = "4.4")]
+mod export_tool_button_test {
+    use godot::obj::{NewGd, Singleton};
+
+    use super::*;
+
+    #[derive(GodotClass)]
+    #[class(init, tool)]
+    struct ToolButtonExporter {
+        #[export_tool_button(fn = Self::my_fn)]
+        other_tool_button: PhantomVar<Callable>,
+
+        #[export_tool_button(fn = Self::my_fn, name = "Run Tool", icon = "MyIcon")]
+        named_tool_button: PhantomVar<Callable>,
+
+        val: i32,
+        base: Base<RefCounted>,
+    }
+
+    impl ToolButtonExporter {
+        fn my_fn(&mut self) {
+            self.val = 33;
+        }
+    }
+
+    #[itest]
+    fn test_tool_button() {
+        let tool_button_exporter = ToolButtonExporter::new_gd();
+        let tool_button_callable = tool_button_exporter
+            .get("other_tool_button")
+            .to::<Callable>();
+        tool_button_callable.call(&[]);
+        assert_eq!(tool_button_exporter.bind().val, 33);
+    }
+
+    // Regression test for https://github.com/godot-rust/gdext/pull/1589.
+    // Before the fix, this test either triggers UB (disengaged) or a panic (balanced/strict safeguards).
+    #[itest]
+    fn test_tool_button_default_value() {
+        let default = godot::classes::ClassDb::singleton()
+            .class_get_property_default_value("ToolButtonExporter", "other_tool_button");
+        let callable = default.to::<Callable>();
+        // Calling on freed instance should not panic; emits godot_error and is a no-op.
+        suppress_godot_print(|| callable.call(&[]));
+    }
+
+    #[itest]
+    fn test_tool_button_hint_string() {
+        let property = ToolButtonExporter::new_gd()
+            .get_property_list()
+            .iter_shared()
+            .find(|dict| dict.at("name").to::<GString>() == "named_tool_button")
+            .expect("tool button property should be present in property list");
+
+        // Godot expects `name,icon` without quotes; the string literals' quotes must not end up in the hint string.
+        assert_eq!(
+            property.at("hint_string").to::<GString>(),
+            "Run Tool,MyIcon"
+        );
+    }
+}

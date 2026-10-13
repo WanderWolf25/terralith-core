@@ -1,0 +1,215 @@
+{
+  "main": {
+    "id": "d737caa4cfc708ba",
+    "type": "split",
+    "children": [
+      {
+        "id": "20358abf12193429",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "818980ef9fb66a82",
+            "type": "leaf",
+            "state": {
+              "type": "canvas",
+              "state": {
+                "file": "Ariquitecture/Arquitecture Canvas.canvas",
+                "viewState": {
+                  "x": 65.85537063241952,
+                  "y": 1031.2288948217674,
+                  "zoom": -1.666666666666666
+                }
+              },
+              "icon": "lucide-layout-dashboard",
+              "title": "Arquitecture Canvas"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "285ec69113d4aaa1",
+    "type": "split",
+    "children": [
+      {
+        "id": "8a315b069f7d3092",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "da2398d2fc558944",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "edf2bc99d71b2538",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "1aab0ed2aecca1bc",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "fa03450284ead1ac",
+    "type": "split",
+    "children": [
+      {
+        "id": "3182a317c199d921",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f922d6858e20b182",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Ariquitecture/Arquitecture Canvas.canvas",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "c6182cdbfe11c4d3",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Ariquitecture/Arquitecture Canvas.canvas",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "96d8ae5a17d221d0",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "c1841e5606a51266",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "4495a0a83a7dfb29",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Ariquitecture/Arquitecture Canvas.canvas",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "818980ef9fb66a82",
+  "lastOpenFiles": [
+    "target/debug/deps/terralith_core.77ngbfc365prrqhovqoesw52f.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.3dnt5culupr7p2oshqdhvdnyq.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.5eyb47zipqcx4h0ewtt1li6se.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.2qhxbgmdv4vln0f9ws2bfn5zh.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.09tj9vbbpej6v1volp35vgqfu.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.avj31benv247zk6xncmznuz0d.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.0pirp2hec3rjjqu0pwpn5cygh.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.bfaxileusuyxtlswhr1g3girx.1y620nt.rcgu.o",
+    "target/debug/deps/terralith_core.d0s4ympqj68dkdynmkwhm51lx.1y620nt.rcgu.o",
+    "target/debug/deps/rustciydCHx/linker-arguments",
+    "target/debug/deps/rustciydCHx/symbols.o",
+    "dependencies/gdext-master/misc/assets/godot-rust-ferris.png",
+    "dependencies/gdext-master/misc/assets/asset-licenses.md",
+    "dependencies/gdext-master/godot/crate-readme.md",
+    "dependencies/gdext-master/ReadMe.md",
+    "dependencies/gdext-master/Contributing.md",
+    "dependencies/gdext-master/Changelog.md",
+    "Ariquitecture/Arquitecture Canvas.canvas"
+  ]
+}
