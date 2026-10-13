@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 godot = { path = "dependencies/gdext-master/godot" }
+noise = "0.9"

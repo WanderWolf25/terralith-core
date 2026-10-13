@@ -1,7 +1,6 @@
 // src/godot.rs
 
 use godot::prelude::*;
-// Quitamos "Mesh" de aquí porque ya no lo usamos directamente
 use godot::classes::{ArrayMesh, HeightMapShape3D}; 
 use godot::classes::mesh::{ArrayType, PrimitiveType}; 
 
@@ -62,8 +61,12 @@ impl TerralithNode {
         let chunk_data = generator.generate_chunk(chunk_x, chunk_z);
 
         let mut godot_vertices = PackedVector3Array::new();
+        let mut godot_normals = PackedVector3Array::new();
+
+        // Populate positions and precomputed analytical normals
         for v in &chunk_data.vertices {
             godot_vertices.push(Vector3::new(v.position[0], v.position[1], v.position[2]));
+            godot_normals.push(Vector3::new(v.normal[0], v.normal[1], v.normal[2]));
         }
 
         let mut godot_indices = PackedInt32Array::new();
@@ -74,12 +77,12 @@ impl TerralithNode {
         let mut arrays = godot::builtin::Array::<Variant>::new();
         let max_arrays = ArrayType::MAX.ord() as usize;
         for _ in 0..max_arrays {
-            // Pasamos el Variant prestado con "&"
             arrays.push(&Variant::nil());
         }
 
-        // Pasamos los Variants prestados con "&"
+        // Pass borrowed variants into vertex, normal, and index slots
         arrays.set(ArrayType::VERTEX.ord() as usize, &godot_vertices.to_variant());
+        arrays.set(ArrayType::NORMAL.ord() as usize, &godot_normals.to_variant());
         arrays.set(ArrayType::INDEX.ord() as usize, &godot_indices.to_variant());
 
         let mut mesh = ArrayMesh::new_gd();
